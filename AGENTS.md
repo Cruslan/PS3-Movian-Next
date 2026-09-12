@@ -579,5 +579,5 @@ Upgrading to **FFmpeg 4.4 LTS** represents the ideal engineering balance. It pro
 1. **Local Branch Renaming:** Renamed local primary branch to `main` via `git branch -M main`.
 2. **Upstream Publication & Tracking:** Pushed branch to `origin/main` and configured tracking via `git push -u origin main`.
 3. **Commit & Tag Alignment:** Verified full commit history parity (`213939a56`) and release tag `v1.0.0` association.
-4. **Default Branch Transition Guidance:** Because GitHub protects the default branch from deletion via remote push (`refusing to delete the current branch`), switching the default branch to `main` under GitHub Repository Settings (`Settings -> Branches -> Default branch`) enables the final removal of the legacy `master` branch.
+4. **Default Branch Transition & Master Deletion:** Executed GitHub REST API PATCH request to set repository default branch to `main`. Subsequently deleted the legacy remote `master` branch via `git push origin --delete master`, pruned obsolete tracking references via `git remote prune origin`, and confirmed `HEAD -> origin/main`.
 
