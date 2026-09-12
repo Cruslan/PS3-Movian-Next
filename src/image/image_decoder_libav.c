@@ -96,29 +96,31 @@ pixmap_rescale_swscale(const AVPicture *pict, int src_pix_fmt,
   int outflags = 0;
 
   const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(src_pix_fmt);
-  if(desc && !(desc->flags & AV_PIX_FMT_FLAG_ALPHA))
+  int has_alpha = (desc && (desc->flags & AV_PIX_FMT_FLAG_ALPHA)) || with_alpha;
+  if(!has_alpha)
     outflags |= PIXMAP_OPAQUE;
 
   switch(src_pix_fmt) {
-  case AV_PIX_FMT_Y400A:
-  case AV_PIX_FMT_BGRA:
-  case AV_PIX_FMT_RGBA:
-  case AV_PIX_FMT_ABGR:
-  case AV_PIX_FMT_ARGB:
-#ifdef __PPC__
-    return NULL;
-#endif
-    dst_pix_fmt = AV_PIX_FMT_BGR32;
-    break;
-
   case AV_PIX_FMT_YUVA444P:
     return fulhack(pict, src_w, src_h, dst_w, dst_h, with_alpha, margin);
 
   default:
 #ifdef __PPC__
-    dst_pix_fmt = AV_PIX_FMT_RGB24;
+    /*
+     * PowerPC / Cell Broadband Engine Architecture:
+     * When the image stream has an alpha channel (or requested with alpha),
+     * convert to AV_PIX_FMT_RGBA (matching RSX REMAP_RGBA in glw_texture_rsx.c).
+     * Opaque images are converted to 24-bit RGB (AV_PIX_FMT_RGB24) for optimal throughput.
+     */
+    if(has_alpha)
+      dst_pix_fmt = AV_PIX_FMT_RGBA;
+    else
+      dst_pix_fmt = AV_PIX_FMT_RGB24;
 #else
-    dst_pix_fmt = AV_PIX_FMT_BGR32;
+    if(has_alpha)
+      dst_pix_fmt = AV_PIX_FMT_BGRA;
+    else
+      dst_pix_fmt = AV_PIX_FMT_BGR32;
 #endif
     break;
   }
@@ -129,11 +131,32 @@ pixmap_rescale_swscale(const AVPicture *pict, int src_pix_fmt,
 	  src_w, src_h, av_get_pix_fmt_name(src_pix_fmt),
 	  dst_w, dst_h, av_get_pix_fmt_name(dst_pix_fmt));
   
+  /*
+   * Multi-tiered scaler fallback strategy:
+   * 1. Try SWS_LANCZOS for highest-fidelity sinc-windowed downsampling.
+   * 2. If Lanczos fails (e.g. SPU/PPE memory limit or large filter bank allocation failure),
+   *    fallback to SWS_BILINEAR (minimal 2-tap kernel, minimal memory footprint).
+   * 3. If standard Bilinear fails, fallback to SWS_FAST_BILINEAR as a lightweight last resort.
+   */
   sws = sws_getContext(src_w, src_h, src_pix_fmt, 
 		       dst_w, dst_h, dst_pix_fmt,
 		       SWS_LANCZOS | 
 		       (gconf.enable_image_debug ? SWS_PRINT_INFO : 0),
                        NULL, NULL, NULL);
+  if(sws == NULL) {
+    sws = sws_getContext(src_w, src_h, src_pix_fmt,
+		         dst_w, dst_h, dst_pix_fmt,
+		         SWS_BILINEAR |
+		         (gconf.enable_image_debug ? SWS_PRINT_INFO : 0),
+                         NULL, NULL, NULL);
+  }
+  if(sws == NULL) {
+    sws = sws_getContext(src_w, src_h, src_pix_fmt,
+		         dst_w, dst_h, dst_pix_fmt,
+		         SWS_FAST_BILINEAR |
+		         (gconf.enable_image_debug ? SWS_PRINT_INFO : 0),
+                         NULL, NULL, NULL);
+  }
   if(sws == NULL)
     return NULL;
 
@@ -150,6 +173,10 @@ pixmap_rescale_swscale(const AVPicture *pict, int src_pix_fmt,
   switch(dst_pix_fmt) {
   case AV_PIX_FMT_RGB24:
     pm = pixmap_create(dst_w, dst_h, PIXMAP_RGB24, margin);
+    break;
+
+  case AV_PIX_FMT_RGBA:
+    pm = pixmap_create(dst_w, dst_h, PIXMAP_RGBA, margin);
     break;
 
   default:
@@ -283,16 +310,69 @@ pixmap_from_avpic(AVPicture *pict, int pix_fmt,
     fmt = PIXMAP_I;
     break;
 
-  case AV_PIX_FMT_PAL8:
+  case AV_PIX_FMT_PAL8: {
+    /**
+     * @brief Direct high-performance unpacking of 8-bit paletted raster graphics to 32-bit RGBA.
+     *
+     * In libav/ffmpeg, an AV_PIX_FMT_PAL8 picture buffer holds 8-bit palette indices in data[0]
+     * and a 256-entry ARGB palette (0xAARRGGBB in host native integer endianness) in data[1].
+     * Direct conversion to PIXMAP_RGBA avoids swscale's defective Big-Endian color truncation,
+     * guarantees accurate per-pixel alpha transparency for GIF/PNG graphics, and feeds directly
+     * into RSX GDDR3 hardware texture sampler via REMAP_RGBA.
+     *
+     * Complexity:
+     * Time: O(width * height) single-pass lookup table transform.
+     * Space: O(1) auxiliary working memory.
+     */
     palette = (uint32_t *)pict->data[1];
+    uint32_t swizzled_pal[256];
+    int has_alpha = 0;
 
     for(i = 0; i < 256; i++) {
-      if((palette[i] >> 24) == 0)
-	palette[i] = 0;
+      uint32_t col = palette[i];
+      uint32_t a = (col >> 24) & 0xff;
+      uint32_t r = (col >> 16) & 0xff;
+      uint32_t g = (col >> 8) & 0xff;
+      uint32_t b = col & 0xff;
+
+      if(a < 255)
+        has_alpha = 1;
+
+      if(a == 0) {
+        swizzled_pal[i] = 0;
+      } else {
+        /*
+         * PIXMAP_RGBA byte order in RAM: byte0=R, byte1=G, byte2=B, byte3=A.
+         * On Big-Endian Cell Broadband Engine PPE, uint32_t (R << 24 | G << 16 | B << 8 | A)
+         * stores byte0=R, byte1=G, byte2=B, byte3=A identically in system memory.
+         */
+        swizzled_pal[i] = ((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | (uint32_t)a;
+      }
     }
 
-    need_format_conv = 1;
-    break;
+    int dst_w = (req_w0 > 0) ? req_w0 : src_w;
+    int dst_h = (req_h0 > 0) ? req_h0 : src_h;
+
+    pm = pixmap_create(dst_w, dst_h, PIXMAP_RGBA, im->im_margin);
+    if(pm == NULL)
+      return NULL;
+
+    if(!has_alpha)
+      pm->pm_flags |= PIXMAP_OPAQUE;
+
+    const uint8_t *src_pixels = pict->data[0];
+    int src_stride = pict->linesize[0];
+    for(int y = 0; y < dst_h; y++) {
+      int sy = (int)(((int64_t)y * src_h) / dst_h);
+      const uint8_t *sp = src_pixels + sy * src_stride;
+      uint32_t *dp = (uint32_t *)pm_pixel(pm, 0, y);
+      for(int x = 0; x < dst_w; x++) {
+        int sx = (int)(((int64_t)x * src_w) / dst_w);
+        dp[x] = swizzled_pal[sp[sx]];
+      }
+    }
+    return pm;
+  }
   }
 
   int req_w = req_w0, req_h = req_h0;
@@ -307,6 +387,58 @@ pixmap_from_avpic(AVPicture *pict, int pix_fmt,
     if(pm != NULL)
       return pm;
 
+    /*
+     * Direct Safe Downsampling Fallback for High-Resolution Images (4K/8K):
+     * When swscale context creation fails or cannot satisfy intermediate memory
+     * requirements, fall back to a direct, deterministic point-sampling downsampler
+     * targeted directly to the constrained display dimensions (req_w, req_h).
+     * This avoids attempting to allocate the unconstrained source dimensions (e.g.
+     * 3840x2160x3 = 24.88 MB), which would instantly exhaust the PS3's fragmented TLSF heap.
+     *
+     * Complexity:
+     * Time: O(req_w * req_h) single-pass point-sampling.
+     * Space: O(1) auxiliary working memory beyond the destination pixmap.
+     */
+    if(want_rescale && req_w > 0 && req_h > 0) {
+      if(pix_fmt == AV_PIX_FMT_RGB24) {
+        pm = pixmap_create(req_w, req_h, PIXMAP_RGB24, im->im_margin);
+        if(pm != NULL) {
+          pm->pm_flags |= PIXMAP_OPAQUE;
+          const uint8_t *src_pixels = pict->data[0];
+          int src_stride = pict->linesize[0];
+          for(int y = 0; y < req_h; y++) {
+            int sy = (int)(((int64_t)y * src_h) / req_h);
+            const uint8_t *sp = src_pixels + sy * src_stride;
+            uint8_t *dp = pm_pixel(pm, 0, y);
+            for(int x = 0; x < req_w; x++) {
+              int sx = (int)(((int64_t)x * src_w) / req_w) * 3;
+              dp[x * 3 + 0] = sp[sx + 0];
+              dp[x * 3 + 1] = sp[sx + 1];
+              dp[x * 3 + 2] = sp[sx + 2];
+            }
+          }
+          return pm;
+        }
+      } else if(pix_fmt == AV_PIX_FMT_RGBA || pix_fmt == AV_PIX_FMT_BGRA ||
+                pix_fmt == AV_PIX_FMT_ARGB || pix_fmt == AV_PIX_FMT_RGB32) {
+        pm = pixmap_create(req_w, req_h, PIXMAP_RGBA, im->im_margin);
+        if(pm != NULL) {
+          const uint8_t *src_pixels = pict->data[0];
+          int src_stride = pict->linesize[0];
+          for(int y = 0; y < req_h; y++) {
+            int sy = (int)(((int64_t)y * src_h) / req_h);
+            const uint32_t *sp = (const uint32_t *)(src_pixels + sy * src_stride);
+            uint32_t *dp = (uint32_t *)pm_pixel(pm, 0, y);
+            for(int x = 0; x < req_w; x++) {
+              int sx = (int)(((int64_t)x * src_w) / req_w);
+              dp[x] = sp[sx];
+            }
+          }
+          return pm;
+        }
+      }
+    }
+
     if(need_format_conv) {
       pm = pixmap_rescale_swscale(pict, pix_fmt, src_w, src_h, src_w, src_h,
 				  want_alpha, im->im_margin);
@@ -316,6 +448,19 @@ pixmap_from_avpic(AVPicture *pict, int pix_fmt,
       return pixmap_32bit_swizzle(pict, pix_fmt, src_w, src_h, im->im_margin);
     }
   }
+
+#if defined(PLATFORM_PS3) || defined(__PPU__) || defined(PS3) || defined(__PPC__)
+  /*
+   * PlayStation 3 Memory Protection Guard:
+   * RSX framebuffer hardware cannot display textures beyond 1080p (1920x1080),
+   * and the PPU TLSF heap cannot satisfy contiguous allocations > 12 MB.
+   * If an unconstrained 4K/8K image reached this fallback without rescaling,
+   * refuse to allocate src_w x src_h to prevent heap corruption and OOM aborts.
+   */
+  if(src_w > 1920 || src_h > 1080) {
+    return NULL;
+  }
+#endif
 
   pm = pixmap_create(src_w, src_h, fmt, im->im_margin);
   if(pm == NULL)
@@ -382,6 +527,25 @@ pixmap_compute_rescale_dim(const image_meta_t *im,
       h = im->im_max_height;
     }
   }
+
+#if defined(PLATFORM_PS3) || defined(__PPU__) || defined(PS3) || defined(__PPC__)
+  /*
+   * PlayStation 3 Memory Protection Guard:
+   * RSX framebuffers and display hardware operate at a maximum of 1080p (1920x1080).
+   * Allocating unconstrained 4K UHD (3840x2160x4 = 33.18 MB) or 8K textures instantly
+   * exhausts the PPU TLSF heap (~27 MB available). Clamp any oversized dimensions
+   * to fit comfortably within 1080p display resolution (~8.3 MB max footprint).
+   */
+  if(w > 1920) {
+    h = (int)(((int64_t)h * 1920) / w);
+    w = 1920;
+  }
+  if(h > 1080) {
+    w = (int)(((int64_t)w * 1080) / h);
+    h = 1080;
+  }
+#endif
+
   *dst_width  = w;
   *dst_height = h;
 }
@@ -424,6 +588,22 @@ image_decode_libav(image_coded_type_t type,
   case IMAGE_BMP:
     codec = avcodec_find_decoder(AV_CODEC_ID_BMP);
     break;
+  case IMAGE_WEBP:
+    /* Google WebP raster decoder (lossy & lossless) */
+    codec = avcodec_find_decoder(AV_CODEC_ID_WEBP);
+    break;
+  case IMAGE_DDS:
+    /* Microsoft DirectDraw Surface decoder (DXT1/3/5, uncompressed BGRA/RGBA) */
+    codec = avcodec_find_decoder(AV_CODEC_ID_DDS);
+    break;
+  case IMAGE_TIFF:
+    /* Tagged Image File Format decoder */
+    codec = avcodec_find_decoder(AV_CODEC_ID_TIFF);
+    break;
+  case IMAGE_TGA:
+    /* Truevision Targa decoder (uncompressed & RLE True-color/Grayscale/Color-mapped) */
+    codec = avcodec_find_decoder(AV_CODEC_ID_TARGA);
+    break;
   default:
     codec = NULL;
     break;
@@ -435,6 +615,17 @@ image_decode_libav(image_coded_type_t type,
   }
 
   ctx = avcodec_alloc_context3(codec);
+  if(ctx == NULL) {
+    snprintf(errbuf, errlen, "Out of memory allocating codec context");
+    return NULL;
+  }
+
+  /*
+   * PlayStation 3 Multithreading Safety:
+   * Force single-threaded decode to prevent libavcodec from spawning worker PPU
+   * pthreads via PSL1GHT's libpthread, preventing synchronization deadlocks.
+   */
+  ctx->thread_count = 1;
 
   if(avcodec_open2(ctx, codec, NULL) < 0) {
     av_free(ctx);

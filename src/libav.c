@@ -407,6 +407,35 @@ media_codec_create_lavc(media_codec_t *cw, const media_codec_params_t *mcp,
   if(codec == NULL)
     return -1;
 
+#if defined(PLATFORM_PS3) || defined(__PPU__) || defined(PS3)
+  /**
+   * PlayStation 3 Cell PPE Software Video Decoding Policy:
+   * The Cell Broadband Engine PPU is an in-order dual-issue PowerPC core with strictly
+   * constrained single-thread compute capabilities and only 256MB system memory.
+   * Software decoding of next-generation video codecs (HEVC/H.265, VP9, AV1)
+   * causes extreme CPU thread starvation, high branch misprediction penalties on the
+   * in-order 2-issue Cell PPE, and unbounded heap consumption that can freeze the system.
+   *
+   * On PS3, hardware acceleration via Cell SPUs (ps3_vdec.c) is utilized for MPEG-2
+   * and H.264. Standard SD and 720p legacy/software video formats (MPEG-4 Part 2 /
+   * DivX / XviD, VP8, MJPEG, FLV1, MPEG-1, DV, WMV) are decoded smoothly in software
+   * via libavcodec and rendered via RSX YUVP shaders. Only HEVC, VP9, and AV1 are
+   * rejected here to safeguard system stability.
+   *
+   * Audio codecs (AAC, MP3, AC3, DTS, FLAC, Vorbis, PCM, etc.) remain fully supported
+   * for software decoding on the PPE as their computational overhead is minimal.
+   */
+  if(codec->type == AVMEDIA_TYPE_VIDEO) {
+    if(cw->codec_id == AV_CODEC_ID_HEVC ||
+       cw->codec_id == AV_CODEC_ID_VP9) {
+      TRACE(TRACE_ERROR, "libav",
+            "PS3: Rejecting heavy video codec '%s' (ID %d) to prevent system freeze",
+            codec->name ? codec->name : "<unknown>", cw->codec_id);
+      return -1;
+    }
+  }
+#endif
+
   cw->ctx = avcodec_alloc_context3(codec);
   if(cw->fmt_ctx != NULL)
     avcodec_copy_context(cw->ctx, cw->fmt_ctx);
@@ -429,8 +458,18 @@ media_codec_create_lavc(media_codec_t *cw, const media_codec_params_t *mcp,
 
     // If we run with vdpau and h264 libav will crash when going
     // back and forth between accelerated and non-accelerated mode
+#if defined(PLATFORM_PS3) || defined(__PPU__) || defined(PS3)
+    /**
+     * PSL1GHT libpthread threading within libavcodec induces PPU thread deadlocks
+     * and condition variable aborts (sys_cond_wait timeout) due to 64KB stack limits.
+     * Force single-threaded decoding on PS3 so that decoding executes synchronously
+     * and safely on Movian's dedicated 'video decoder' thread without spawning pthreads.
+     */
+    cw->ctx->thread_count = 1;
+#else
     if(!(video_settings.vdpau && cw->codec_id == AV_CODEC_ID_H264))
       cw->ctx->thread_count = gconf.concurrency;
+#endif
 
     cw->ctx->opaque = cw;
     cw->ctx->refcounted_frames = 1;

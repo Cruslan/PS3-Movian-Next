@@ -149,7 +149,9 @@ init_global_info(void)
   prop_set(s, "name", PROP_SET_STRING, APPNAMEUSER);
   prop_set(s, "version", PROP_SET_STRING, appversion);
   prop_set(s, "fullversion", PROP_SET_STRING, appversion);
-  prop_set(s, "copyright", PROP_SET_STRING, "© 2006 - 2018 Lonelycoder AB");
+  prop_set(s, "copyright", PROP_SET_STRING, "© 2006 - 2018 Andreas Öman / Lonelycoder AB");
+  prop_set(s, "author", PROP_SET_STRING, "Andreas Öman (Lonelycoder AB)");
+  prop_set(s, "port", PROP_SET_STRING, "PSL1GHT v2 Modernization Port by Cruslan");
 }
 
 
@@ -344,6 +346,9 @@ main_init(void)
   hts_cond_init(&gconf.state_cond, &gconf.state_mutex);
 
   gconf.exit_code = 1;
+
+  /* UPnP renderer and SSDP multicast discovery disabled by default for privacy */
+  gconf.disable_upnp = 1;
 
   unicode_init();
 
@@ -582,6 +587,10 @@ parse_opts(int argc, char **argv)
 #if ENABLE_HTTPSERVER
     } else if(!strcmp(argv[0], "--disable-upnp")) {
       gconf.disable_upnp = 1;
+      argc -= 1; argv += 1;
+      continue;
+    } else if(!strcmp(argv[0], "--enable-upnp")) {
+      gconf.disable_upnp = 0;
       argc -= 1; argv += 1;
       continue;
 #endif

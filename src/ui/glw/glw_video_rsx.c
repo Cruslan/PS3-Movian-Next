@@ -31,8 +31,15 @@
 #include "main.h"
 #include "glw_video_common.h"
 
-#include "rsx/nv40.h"
-#include "rsx/reality.h"
+/**
+ * PSL1GHT v2 RSX Subsystem Headers:
+ * Hardware video surface rendering bindings for NV40/G70 GPU.
+ */
+#include <rsx/gcm_sys.h>
+#include <rsx/rsx.h>
+#include <rsx/rsx_program.h>
+#include <rsx/commands.h>
+#include <rsx/nv40.h>
 
 #include "video/video_decoder.h"
 #include "video/video_playback.h"
@@ -41,25 +48,56 @@
 /**
  * gv_surface_mutex must be held
  */
+/**
+ * @brief Resets and releases RSX memory allocated for a video surface.
+ *
+ * This function releases any allocated RSX GDDR3 memory back to the RSX extent
+ * memory pool if the offset is valid (> 0) and not shared by another active surface.
+ * If offset is <= 0 (e.g. unallocated or previous allocation failure), it safely
+ * clears the structure without invoking rsx_free on an invalid address.
+ *
+ * @param gv Pointer to GLW video context.
+ * @param gvs Pointer to video surface structure to reset.
+ *
+ * @complexity Time: O(N) where N = GLW_VIDEO_MAX_SURFACES. Space: O(1).
+ */
 static void
 surface_reset(glw_video_t *gv, glw_video_surface_t *gvs)
 {
   int i;
 
+  /* If surface has no valid RSX allocation, reset pointers and exit early */
+  if(gvs->gvs_offset <= 0) {
+    gvs->gvs_offset = 0;
+    gvs->gvs_size = 0;
+    gvs->gvs_data[0] = NULL;
+    gvs->gvs_data[1] = NULL;
+    gvs->gvs_data[2] = NULL;
+    return;
+  }
+
+  /* Check if another surface shares the same RSX memory chunk (e.g. multi-view) */
   for(i = 0; i < GLW_VIDEO_MAX_SURFACES; i++) {
     if(gv->gv_surfaces[i].gvs_offset == gvs->gvs_offset &&
        gvs != &gv->gv_surfaces[i]) {
-      // Memory is shared
+      /* Memory is shared with another surface; do not free pool block */
       gvs->gvs_offset = 0;
       gvs->gvs_size = 0;
+      gvs->gvs_data[0] = NULL;
+      gvs->gvs_data[1] = NULL;
+      gvs->gvs_data[2] = NULL;
       return;
     }
   }
 
-  if(gvs->gvs_offset) {
+  /* Free the RSX GDDR3 extent pool block and nullify all pointers */
+  if(gvs->gvs_offset > 0 && gvs->gvs_size > 0) {
     rsx_free(gvs->gvs_offset, gvs->gvs_size);
     gvs->gvs_offset = 0;
     gvs->gvs_size = 0;
+    gvs->gvs_data[0] = NULL;
+    gvs->gvs_data[1] = NULL;
+    gvs->gvs_data[2] = NULL;
   }
 }
 
@@ -78,49 +116,53 @@ yuvp_reset(glw_video_t *gv)
 
 
 
+/**
+ * Luminance Texture Remap Macro:
+ * Replicates single byte component into all shader vector channels (R, G, B, A).
+ */
+#define REMAP_L8 \
+  GCM_TEXTURE_REMAP_MODE(GCM_TEXTURE_REMAP_ORDER_XYXY, \
+                         GCM_TEXTURE_REMAP_COLOR_B, GCM_TEXTURE_REMAP_COLOR_B, \
+                         GCM_TEXTURE_REMAP_COLOR_B, GCM_TEXTURE_REMAP_COLOR_B, \
+                         GCM_TEXTURE_REMAP_TYPE_REMAP, GCM_TEXTURE_REMAP_TYPE_REMAP, \
+                         GCM_TEXTURE_REMAP_TYPE_REMAP, GCM_TEXTURE_REMAP_TYPE_REMAP)
+
+/**
+ * @brief Configures an 8-bit planar YUV component texture descriptor.
+ *
+ * @param tex Destination gcmTexture structure pointer.
+ * @param offset Byte offset in RSX GDDR3 VRAM.
+ * @param width Plane width in pixels.
+ * @param height Plane height in pixels.
+ * @param stride Plane scanline pitch in bytes.
+ *
+ * @complexity Time: O(1). Space: O(1).
+ */
 static void
-init_tex(realityTexture *tex, uint32_t offset,
-	 uint32_t width, uint32_t height, uint32_t stride,
-	 uint32_t fmt, int repeat, int swizzle)
+init_tex(gcmTexture *tex, uint32_t offset,
+         uint32_t width, uint32_t height, uint32_t stride)
 {
-  tex->swizzle = swizzle;
-  tex->offset = offset;
-
-  tex->format = fmt |
-    NV40_3D_TEX_FORMAT_LINEAR  | 
-    NV30_3D_TEX_FORMAT_DIMS_2D |
-    NV30_3D_TEX_FORMAT_DMA0 |
-    NV30_3D_TEX_FORMAT_NO_BORDER | (0x8000) |
-    (1 << NV40_3D_TEX_FORMAT_MIPMAP_COUNT__SHIFT);
-
-  if(repeat) {
-    tex->wrap =
-      NV30_3D_TEX_WRAP_S_REPEAT |
-      NV30_3D_TEX_WRAP_T_REPEAT |
-      NV30_3D_TEX_WRAP_R_REPEAT;
-  } else {
-    tex->wrap =
-      NV30_3D_TEX_WRAP_S_CLAMP_TO_EDGE | 
-      NV30_3D_TEX_WRAP_T_CLAMP_TO_EDGE | 
-      NV30_3D_TEX_WRAP_R_CLAMP_TO_EDGE;
-  }
-
-  tex->enable = NV40_3D_TEX_ENABLE_ENABLE;
-
-  tex->filter =
-    NV30_3D_TEX_FILTER_MIN_LINEAR |
-    NV30_3D_TEX_FILTER_MAG_LINEAR | 0x3fd6;
-
-  tex->width  = width;
-  tex->height = height;
-  tex->stride = stride;
+  memset(tex, 0, sizeof(*tex));
+  tex->format    = GCM_TEXTURE_FORMAT_LIN | GCM_TEXTURE_FORMAT_B8;
+  tex->mipmap    = 1;
+  tex->dimension = GCM_TEXTURE_DIMS_2D;
+  tex->cubemap   = GCM_FALSE;
+  tex->remap     = REMAP_L8;
+  tex->width     = (u16)width;
+  tex->height    = (u16)height;
+  tex->depth     = 1;
+  tex->location  = GCM_LOCATION_RSX;
+  tex->pitch     = stride;
+  tex->offset    = offset;
 }
 
 #define ROUND_UP(p, round) (((p) + (round) - 1) & ~((round) - 1))
 
-
 /**
+ * @brief Allocates and initializes RSX GDDR3 memory buffers for planar YUV video frames.
  *
+ * @param gv GLW video context pointer.
+ * @param gvs Video surface structure to populate.
  */
 static void
 surface_init(glw_video_t *gv, glw_video_surface_t *gvs)
@@ -128,32 +170,41 @@ surface_init(glw_video_t *gv, glw_video_surface_t *gvs)
   int i;
   int siz[3];
 
+  /* First release any previous RSX allocation for this surface descriptor */
   surface_reset(gv, gvs);
 
+  /* Compute byte size for Y, U, and V planar buffers aligned to 16-byte boundaries */
   for(i = 0; i < 3; i++)
     siz[i] = ROUND_UP(gvs->gvs_width[i] * gvs->gvs_height[i], 16);
 
   gvs->gvs_size = siz[0] + siz[1] + siz[2];
   gvs->gvs_offset = rsx_alloc(gvs->gvs_size, 16);
 
+  /* Guard against VRAM allocation failure (e.g. low memory or high fragment pool exhaustion) */
+  if(gvs->gvs_offset <= 0) {
+    TRACE(TRACE_ERROR, "RSX",
+          "Low VRAM: Failed to allocate %d bytes for YUVP surface (result offset=%d)",
+          gvs->gvs_size, gvs->gvs_offset);
+    gvs->gvs_offset = 0;
+    gvs->gvs_size = 0;
+    gvs->gvs_data[0] = NULL;
+    gvs->gvs_data[1] = NULL;
+    gvs->gvs_data[2] = NULL;
+    return;
+  }
+
+  /* Map RSX GDDR3 physical video RAM offsets into Cell PPU effective address space */
   gvs->gvs_data[0] = rsx_to_ppu(gvs->gvs_offset);
   gvs->gvs_data[1] = rsx_to_ppu(gvs->gvs_offset + siz[0]);
   gvs->gvs_data[2] = rsx_to_ppu(gvs->gvs_offset + siz[0] + siz[1]);
 
   int offset = gvs->gvs_offset;
   for(i = 0; i < 3; i++) {
-
     init_tex(&gvs->gvs_tex[i],
-	     offset,
-	     gvs->gvs_width[i],
-	     gvs->gvs_height[i],
-	     gvs->gvs_width[i],
-	     NV30_3D_TEX_FORMAT_FORMAT_I8, 0,
-	     NV30_3D_TEX_SWIZZLE_S0_X_S1 | NV30_3D_TEX_SWIZZLE_S0_Y_S1 |
-	     NV30_3D_TEX_SWIZZLE_S0_Z_S1 | NV30_3D_TEX_SWIZZLE_S0_W_S1 |
-	     NV30_3D_TEX_SWIZZLE_S1_X_X | NV30_3D_TEX_SWIZZLE_S1_Y_Y |
-	     NV30_3D_TEX_SWIZZLE_S1_Z_Z | NV30_3D_TEX_SWIZZLE_S1_W_W
-	     );
+             offset,
+             gvs->gvs_width[i],
+             gvs->gvs_height[i],
+             gvs->gvs_width[i]);
     offset += siz[i];
   }
 }
@@ -163,49 +214,73 @@ surface_init(glw_video_t *gv, glw_video_surface_t *gvs)
 /**
  *
  */
+/**
+ * @brief Updates shader uniform parameters for video color space conversion and blending.
+ *
+ * @param gr Graphics root context pointer.
+ * @param gp Video program shader pair.
+ * @param args Video context pointer (glw_video_t*).
+ * @param rj Render job descriptor.
+ */
 static void
 glw_video_rsx_load_uniforms(glw_root_t *gr, glw_program_t *gp, void *args,
                             const glw_render_job_t *rj)
 {
-  glw_video_t *gv = args;
+  glw_video_t *gv = (glw_video_t *)args;
   float f4[4];
 
   glw_backend_root_t *be = &gr->gr_be;
   gcmContextData *ctx = be->be_ctx;
   rsx_fp_t *rfp = gp->gp_fragment_program;
 
-  if(rfp->rfp_u_blend != -1) {
+  if(rfp->rfp_u_blend != NULL) {
     f4[0] = gv->gv_blend;
-    f4[1] = 0;
-    f4[2] = 0;
-    f4[3] = 0;
-    realitySetFragmentProgramParameter(ctx, rfp->rfp_binary,
-				       rfp->rfp_u_blend, f4,
-				       rfp->rfp_rsx_location);
+    f4[1] = 0.0f;
+    f4[2] = 0.0f;
+    f4[3] = 0.0f;
+    rsxSetFragmentProgramParameter(ctx, rfp->rfp_binary,
+                                   rfp->rfp_u_blend, f4,
+                                   rfp->rfp_rsx_location,
+                                   GCM_LOCATION_RSX);
   }
 
+  if(rfp->rfp_u_color_matrix != NULL)
+    rsxSetFragmentProgramParameter(ctx, rfp->rfp_binary,
+                                   rfp->rfp_u_color_matrix,
+                                   gv->gv_cmatrix_cur,
+                                   rfp->rfp_rsx_location,
+                                   GCM_LOCATION_RSX);
 
-  if(rfp->rfp_u_color_matrix != -1)
-    realitySetFragmentProgramParameter(ctx, rfp->rfp_binary,
-				       rfp->rfp_u_color_matrix,
-				       gv->gv_cmatrix_cur,
-				       rfp->rfp_rsx_location);
-
-  if(rfp->rfp_u_color != -1) {
-    f4[0] = 0;
-    f4[1] = 0;
-    f4[2] = 0;
+  if(rfp->rfp_u_color != NULL) {
+    f4[0] = 0.0f;
+    f4[1] = 0.0f;
+    f4[2] = 0.0f;
     f4[3] = rj->alpha;
 
-    realitySetFragmentProgramParameter(ctx, rfp->rfp_binary,
-				       rfp->rfp_u_color, f4,
-				       rfp->rfp_rsx_location);
+    rsxSetFragmentProgramParameter(ctx, rfp->rfp_binary,
+                                   rfp->rfp_u_color, f4,
+                                   rfp->rfp_rsx_location,
+                                   GCM_LOCATION_RSX);
   }
 }
 
+/**
+ * @brief Binds a video planar texture stage to RSX hardware texture unit.
+ */
+static inline void
+rsx_bind_video_texture(gcmContextData *ctx, int unit, const gcmTexture *tex)
+{
+  rsxLoadTexture(ctx, (u8)unit, tex);
+  /* Configure single base mipmap level without out-of-bounds LOD fetching */
+  rsxTextureControl(ctx, (u8)unit, GCM_TRUE, 0, 0, GCM_TEXTURE_MAX_ANISO_1);
+  /* Linear video plane filtering without convolution */
+  rsxTextureFilter(ctx, (u8)unit, 0, GCM_TEXTURE_LINEAR, GCM_TEXTURE_LINEAR, 0);
+  rsxTextureWrapMode(ctx, (u8)unit, GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE,
+                     GCM_TEXTURE_CLAMP_TO_EDGE, 0, GCM_TEXTURE_ZFUNC_LESS, 0);
+}
 
 /**
- *
+ * @brief Binds planar YUV textures to fragment program sampler stages.
  */
 static void
 load_texture_yuv(glw_root_t *gr, glw_program_t *gp, void *args,
@@ -217,23 +292,30 @@ load_texture_yuv(glw_root_t *gr, glw_program_t *gp, void *args,
   const glw_video_surface_t *s = (const glw_video_surface_t *)t;
 
   if(num == 1) {
-
     for(int i = 0; i < 3; i++)
       if(rfp->rfp_texunit[i+3] != -1)
-        realitySetTexture(ctx, rfp->rfp_texunit[i+3], &s->gvs_tex[i]);
+        rsx_bind_video_texture(ctx, rfp->rfp_texunit[i+3], &s->gvs_tex[i]);
   } else {
-
     for(int i = 0; i < 3; i++)
       if(rfp->rfp_texunit[i] != -1)
-        realitySetTexture(ctx, rfp->rfp_texunit[i], &s->gvs_tex[i]);
+        rsx_bind_video_texture(ctx, rfp->rfp_texunit[i], &s->gvs_tex[i]);
   }
-
 }
 
 
 
 /**
+ * @brief Initializes the RSX planar YUV video rendering engine.
  *
+ * Configures the pipeline callbacks, clears uniform color matrices,
+ * and initializes the surface pool descriptors. The active surface queue is
+ * capped at 4 surfaces instead of 10 to conserve valuable RSX GDDR3 VRAM
+ * (~5.5MB working set vs ~13.8MB for 720p; ~12.4MB vs ~31.1MB for 1080p).
+ *
+ * @param gv Pointer to GLW video context.
+ * @return 0 on success.
+ *
+ * @complexity Time: O(GLW_VIDEO_MAX_SURFACES). Space: O(1).
  */
 static int
 yuvp_init(glw_video_t *gv)
@@ -246,9 +328,17 @@ yuvp_init(glw_video_t *gv)
 
   memset(gv->gv_cmatrix_cur, 0, sizeof(float) * 16);
 
-  for(i = 0; i < 10; i++) {
+  /* Cleanly initialize all surface descriptors in the pool */
+  for(i = 0; i < GLW_VIDEO_MAX_SURFACES; i++) {
     glw_video_surface_t *gvs = &gv->gv_surfaces[i];
-    TAILQ_INSERT_TAIL(&gv->gv_avail_queue, gvs, gvs_link);
+    gvs->gvs_offset = 0;
+    gvs->gvs_size = 0;
+    gvs->gvs_data[0] = NULL;
+    gvs->gvs_data[1] = NULL;
+    gvs->gvs_data[2] = NULL;
+    /* Limit the active surface queue pool to 4 to conserve RSX GDDR3 VRAM */
+    if(i < 4)
+      TAILQ_INSERT_TAIL(&gv->gv_avail_queue, gvs, gvs_link);
   }
   return 0;
 }
@@ -320,6 +410,9 @@ gv_color_matrix_set(glw_video_t *gv, const struct frame_info *fi)
   }
 
   memcpy(gv->gv_cmatrix_tgt, f, sizeof(float) * 16);
+  /* If current matrix is uninitialized (all zeros), populate immediately to prevent dark start */
+  if(gv->gv_cmatrix_cur[0] == 0.0f)
+    memcpy(gv->gv_cmatrix_cur, f, sizeof(float) * 16);
 }
 
 
@@ -432,6 +525,13 @@ yuvp_deliver(const frame_info_t *fi, glw_video_t *gv, glw_video_engine_t *gve)
   if((s = glw_video_get_surface(gv, wvec, hvec)) == NULL)
     return -1;
 
+  /* Verify surface has valid RSX GDDR3 memory backing before copying pixel data */
+  if(s->gvs_offset <= 0 || s->gvs_data[0] == NULL) {
+    TAILQ_INSERT_TAIL(&gv->gv_avail_queue, s, gvs_link);
+    hts_cond_signal(&gv->gv_avail_queue_cond);
+    return -1;
+  }
+
   if(!fi->fi_interlaced) {
 
     for(i = 0; i < 3; i++) {
@@ -474,6 +574,13 @@ yuvp_deliver(const frame_info_t *fi, glw_video_t *gv, glw_video_engine_t *gve)
 
     if((s = glw_video_get_surface(gv, wvec, hvec)) == NULL)
       return -1;
+
+    /* Verify second field surface has valid RSX GDDR3 memory backing */
+    if(s->gvs_offset <= 0 || s->gvs_data[0] == NULL) {
+      TAILQ_INSERT_TAIL(&gv->gv_avail_queue, s, gvs_link);
+      hts_cond_signal(&gv->gv_avail_queue_cond);
+      return -1;
+    }
 
     for(i = 0; i < 3; i++) {
       w = wvec[i];
@@ -555,14 +662,8 @@ rsx_deliver(const frame_info_t *fi, glw_video_t *gv, glw_video_engine_t *gve)
       const int offset = fi->fi_u32[i];
 
       init_tex(&gvs->gvs_tex[i],
-	       offset + !fi->fi_tff * fi->fi_pitch[i],
-	       w, h, fi->fi_pitch[i] * 2,
-	       NV30_3D_TEX_FORMAT_FORMAT_I8, 0,
-	       NV30_3D_TEX_SWIZZLE_S0_X_S1 | NV30_3D_TEX_SWIZZLE_S0_Y_S1 |
-	       NV30_3D_TEX_SWIZZLE_S0_Z_S1 | NV30_3D_TEX_SWIZZLE_S0_W_S1 |
-	       NV30_3D_TEX_SWIZZLE_S1_X_X | NV30_3D_TEX_SWIZZLE_S1_Y_Y |
-	       NV30_3D_TEX_SWIZZLE_S1_Z_Z | NV30_3D_TEX_SWIZZLE_S1_W_W
-	       );
+               offset + !fi->fi_tff * fi->fi_pitch[i],
+               w, h, fi->fi_pitch[i] * 2);
     }
     glw_video_put_surface(gv, gvs, fi->fi_pts, fi->fi_epoch,
 			  fi->fi_duration/2, 1, !fi->fi_tff);
@@ -587,14 +688,8 @@ rsx_deliver(const frame_info_t *fi, glw_video_t *gv, glw_video_engine_t *gve)
       const int offset = fi->fi_u32[i];
 
       init_tex(&gvs->gvs_tex[i],
-	       offset + !!fi->fi_tff * fi->fi_pitch[i],
-	       w, h, fi->fi_pitch[i] * 2,
-	       NV30_3D_TEX_FORMAT_FORMAT_I8, 0,
-	       NV30_3D_TEX_SWIZZLE_S0_X_S1 | NV30_3D_TEX_SWIZZLE_S0_Y_S1 |
-	       NV30_3D_TEX_SWIZZLE_S0_Z_S1 | NV30_3D_TEX_SWIZZLE_S0_W_S1 |
-	       NV30_3D_TEX_SWIZZLE_S1_X_X | NV30_3D_TEX_SWIZZLE_S1_Y_Y |
-	       NV30_3D_TEX_SWIZZLE_S1_Z_Z | NV30_3D_TEX_SWIZZLE_S1_W_W
-	       );
+               offset + !!fi->fi_tff * fi->fi_pitch[i],
+               w, h, fi->fi_pitch[i] * 2);
     }
 
     glw_video_put_surface(gv, gvs, fi->fi_pts + fi->fi_duration, fi->fi_epoch,
@@ -609,14 +704,8 @@ rsx_deliver(const frame_info_t *fi, glw_video_t *gv, glw_video_engine_t *gve)
       const int offset = fi->fi_u32[i];
 
       init_tex(&gvs->gvs_tex[i],
-	       offset,
-	       w, h, fi->fi_pitch[i],
-	       NV30_3D_TEX_FORMAT_FORMAT_I8, 0,
-	       NV30_3D_TEX_SWIZZLE_S0_X_S1 | NV30_3D_TEX_SWIZZLE_S0_Y_S1 |
-	       NV30_3D_TEX_SWIZZLE_S0_Z_S1 | NV30_3D_TEX_SWIZZLE_S0_W_S1 |
-	       NV30_3D_TEX_SWIZZLE_S1_X_X | NV30_3D_TEX_SWIZZLE_S1_Y_Y |
-	       NV30_3D_TEX_SWIZZLE_S1_Z_Z | NV30_3D_TEX_SWIZZLE_S1_W_W
-	       );
+               offset,
+               w, h, fi->fi_pitch[i]);
     }
     glw_video_put_surface(gv, gvs, fi->fi_pts, fi->fi_epoch,
 			  fi->fi_duration, 0, 0);

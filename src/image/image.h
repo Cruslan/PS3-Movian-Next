@@ -80,6 +80,10 @@ typedef enum image_coded_type {
   IMAGE_GIF = 3,
   IMAGE_SVG = 4,
   IMAGE_BMP = 5,
+  IMAGE_WEBP = 6,  /**< Google WebP raster graphics (lossy/lossless) */
+  IMAGE_DDS = 7,   /**< Microsoft DirectDraw Surface (DDS texture container) */
+  IMAGE_TIFF = 8,  /**< Tagged Image File Format (TIFF) */
+  IMAGE_TGA = 9,   /**< Truevision Targa (TGA) raster graphics (RLE & uncompressed) */
 } image_coded_type_t;
 
 

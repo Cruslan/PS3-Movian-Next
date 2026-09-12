@@ -73,11 +73,12 @@ torrent_settings_init(void)
 
   snprintf(defpath, sizeof(defpath), "%s/bittorrentcache", gconf.cache_path);
 
+  /* BitTorrent engine disabled by default to prevent unauthorized network traffic */
   setting_create(SETTING_BOOL, s, SETTINGS_INITIAL_UPDATE,
                  SETTING_TITLE(_p("Enable bittorrent")),
                  SETTING_MUTEX(&bittorrent_mutex),
                  SETTING_WRITE_BOOL(&btg.btg_enabled),
-                 SETTING_VALUE(1),
+                 SETTING_VALUE(0),
                  SETTING_STORE("bittorrent", "enable"),
                  NULL);
 

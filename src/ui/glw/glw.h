@@ -103,14 +103,10 @@ typedef struct glw_rect {
 
 // ------------------- Backends -----------------
 
-#if CONFIG_GLW_BACKEND_OPENGL || ENABLE_GLW_BACKEND_OPENGL_ES
-#include "glw_opengl.h"
-#elif CONFIG_GLW_BACKEND_GX
-#include "glw_gx.h"
-#elif CONFIG_GLW_BACKEND_RSX
+#if CONFIG_GLW_BACKEND_RSX
 #include "glw_rsx.h"
 #else
-#error No backend for glw
+#error No backend for glw (PS3 RSX backend is required)
 #endif
 
 // ------------------- Math mode -----------------

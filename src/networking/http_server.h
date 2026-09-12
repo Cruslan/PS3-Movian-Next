@@ -37,6 +37,20 @@ typedef int (http_callback_t)(http_connection_t *hc,
 
 void http_path_remove(struct http_path *p);
 
+/**
+ * @brief Dynamically toggle the HTTP server listening state on TCP port 42000.
+ *
+ * @details When enabled (1), creates and binds an asynchronous listening socket
+ *          on port 42000 (and optional SSL port 42443), exposing web remote control
+ *          and UPnP endpoints. When disabled (0), gracefully unbinds and tears down
+ *          the socket to preserve network privacy and security.
+ *
+ * @param on Integer flag; 1 to start listening, 0 to terminate listening.
+ * @return void
+ * @complexity O(1) socket operation.
+ */
+void http_server_set_enabled(int on);
+
 struct http_path *http_path_add(const char *path, void *opaque,
                                 http_callback_t *callback,
                                 int leaf);

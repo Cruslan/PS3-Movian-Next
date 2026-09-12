@@ -677,6 +677,66 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
     return NULL;
   }
 
+#if defined(PLATFORM_PS3) || defined(__PPU__) || defined(PS3)
+  /**
+   * PS3 Hardware Video Codec Pre-Flight Validation:
+   * The Cell Broadband Engine PPU is an in-order PowerPC processor lacking adequate
+   * computational throughput and cache hierarchy to decode modern non-hardware video
+   * formats (such as H.265/HEVC, AV1, VP8, VP9, or VC-1) in software. Attempting to
+   * decode such formats software-side leads to 100% CPU thread starvation, unbounded
+   * mutex contention, and total application freeze.
+   *
+   * On PS3, video playback is strictly restricted to hardware-accelerated formats
+   * (H.264 / AV_CODEC_ID_H264 and MPEG-2 / AV_CODEC_ID_MPEG2VIDEO via cellVdec).
+   * If this container contains video streams but none are supported by hardware,
+   * cleanly close the demuxer, populate errbuf with a localized failure message,
+   * and abort playback immediately before spawning any subtitle scanner threads or
+   * allocating codec pipelines, seamlessly returning the user to the navigation menu.
+   */
+  int has_video = 0;
+  int supported_video = 0;
+  int first_video_codec_id = 0;
+  int stream_idx;
+
+  for(stream_idx = 0; stream_idx < fctx->nb_streams; stream_idx++) {
+    AVStream *st = fctx->streams[stream_idx];
+    if(st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+      has_video = 1;
+      if(first_video_codec_id == 0)
+        first_video_codec_id = st->codec->codec_id;
+
+      /*
+       * Block next-generation computationally prohibitive codecs (HEVC/H.265, VP9, AV1)
+       * that exceed the in-order 2-issue Cell PPE's CPU limits and induce thread starvation.
+       * Also block unrecognized video codecs (such as AV1 containers where codec_id is
+       * AV_CODEC_ID_NONE or no decoder exists in Libav 11).
+       * Standard SD and 720p software codecs (MPEG-4 Part 2 / DivX / XviD, VP8, MJPEG,
+       * Sorenson Spark / FLV1, MPEG-1, DV, WMV) are supported via libavcodec and RSX YUVP rendering.
+       */
+      if(st->codec->codec_id == AV_CODEC_ID_HEVC ||
+         st->codec->codec_id == AV_CODEC_ID_VP9 ||
+         st->codec->codec_id == AV_CODEC_ID_NONE ||
+         avcodec_find_decoder(st->codec->codec_id) == NULL) {
+        supported_video = 0;
+        first_video_codec_id = st->codec->codec_id;
+        break;
+      }
+      supported_video = 1;
+    }
+  }
+
+  if(has_video && !supported_video) {
+    const AVCodec *codec = avcodec_find_decoder(first_video_codec_id);
+    const char *cname = codec ? codec->name : (first_video_codec_id == 0 ? "AV1/Unknown" : "unknown");
+    snprintf(errbuf, errlen, "Unable to play: Unsupported video format (%s)", cname);
+    TRACE(TRACE_ERROR, "Video",
+          "PS3: Unsupported video codec '%s' (ID %d) in %s. Aborting and returning to menu.",
+          cname, first_video_codec_id, url);
+    fa_libav_close_format(fctx, 0);
+    return NULL;
+  }
+#endif
+
   usage_event("Play video", 1, USAGE_SEG("format", fctx->iformat->name));
 
   mp->mp_audio.mq_stream = -1;
@@ -758,6 +818,9 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
   LIST_INIT(&alist);
 
 
+  int has_video_stream = 0;
+  int unsupported_video_codec_id = 0;
+
   for(i = 0; i < fctx->nb_streams; i++) {
     char str[256];
     media_codec_params_t mcp = {0};
@@ -770,6 +833,8 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
 
     switch(ctx->codec_type) {
     case AVMEDIA_TYPE_VIDEO:
+      has_video_stream = 1;
+      unsupported_video_codec_id = ctx->codec_id;
       mcp.width = ctx->width;
       mcp.height = ctx->height;
       mcp.profile = ctx->profile;
@@ -867,6 +932,43 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
 	break;
       }
     }
+  }
+
+  /**
+   * Deterministic Video Stream Availability & Codec Validation:
+   * If the container possesses one or more video streams (e.g. H.265/HEVC, AV1, VP9),
+   * but no decoder could be instantiated (mp->mp_video.mq_stream == -1),
+   * do not proceed into video_player_loop. Proceeding without a video decoder
+   * results in an unrendered blank canvas or thread stall.
+   * Instead, cleanly deallocate all acquired resources, populate errbuf with a
+   * descriptive error message, and return NULL to trigger a user-facing error notification.
+   */
+  if(has_video_stream && mp->mp_video.mq_stream == -1) {
+    const AVCodec *uc = avcodec_find_decoder(unsupported_video_codec_id);
+    const char *cname = uc ? uc->name : "unknown";
+    snprintf(errbuf, errlen, "Unable to play: Unsupported video format (%s)", cname);
+    TRACE(TRACE_ERROR, "Video", "No video decoder available for %s (codec: %s)",
+          url, cname);
+
+    prop_set(mp->mp_prop_root, "loading", PROP_SET_INT, 0);
+    htsmsg_release(vpi);
+
+    for(i = 0; i < cwvec_size; i++)
+      if(cwvec[i] != NULL)
+        media_codec_deref(cwvec[i]);
+
+    attachment_unload_all(&alist);
+    media_format_deref(fw);
+
+    if(ss != NULL)
+      sub_scanner_destroy(ss);
+
+#if ENABLE_METADATA
+    if(md != NULL)
+      metadata_destroy(md);
+#endif
+
+    return NULL;
   }
 
   int flags = MP_CAN_PAUSE;

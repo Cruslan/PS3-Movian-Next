@@ -24,7 +24,55 @@
 
 
 #include <sys/thread.h>
-#include <psl1ght/lv2.h>
+
+/**
+ * PPU LV2 Kernel Services Header (PSL1GHT v2):
+ * Supplies lightweight mutex (sys_lwmutex), system mutex, and condition variable definitions for PPU concurrency.
+ */
+#include <ppu-lv2.h>
+#include <lv2/mutex.h>
+#include <sys/mutex.h>
+#include <sys/cond.h>
+
+#ifndef Lv2Syscall0
+#define Lv2Syscall0(sc) ({ lv2syscall0(sc); (s64)p1; })
+#define Lv2Syscall1(sc, a1) ({ lv2syscall1(sc, a1); (s64)p1; })
+#define Lv2Syscall2(sc, a1, a2) ({ lv2syscall2(sc, a1, a2); (s64)p1; })
+#define Lv2Syscall3(sc, a1, a2, a3) ({ lv2syscall3(sc, a1, a2, a3); (s64)p1; })
+#define Lv2Syscall4(sc, a1, a2, a3, a4) ({ lv2syscall4(sc, a1, a2, a3, a4); (s64)p1; })
+#define Lv2Syscall5(sc, a1, a2, a3, a4, a5) ({ lv2syscall5(sc, a1, a2, a3, a4, a5); (s64)p1; })
+#define Lv2Syscall6(sc, a1, a2, a3, a4, a5, a6) ({ lv2syscall6(sc, a1, a2, a3, a4, a5, a6); (s64)p1; })
+#define Lv2Syscall7(sc, a1, a2, a3, a4, a5, a6, a7) ({ lv2syscall7(sc, a1, a2, a3, a4, a5, a6, a7); (s64)p1; })
+#define Lv2Syscall8(sc, a1, a2, a3, a4, a5, a6, a7, a8) ({ lv2syscall8(sc, a1, a2, a3, a4, a5, a6, a7, a8); (s64)p1; })
+#endif
+
+typedef sys_mutex_attr_t sys_mutex_attribute_t;
+typedef sys_cond_attr_t sys_cond_attribute_t;
+
+#define MUTEX_PROTOCOL_PRIORITY SYS_MUTEX_PROTOCOL_PRIO
+#define MUTEX_NOT_RECURSIVE SYS_MUTEX_ATTR_NOT_RECURSIVE
+#define MUTEX_RECURSIVE SYS_MUTEX_ATTR_RECURSIVE
+
+#define sys_mutex_create(m, a) sysMutexCreate(m, a)
+#define sys_mutex_destroy(m) sysMutexDestroy(m)
+#define sys_mutex_lock(m, t) sysMutexLock(m, t)
+#define sys_mutex_trylock(m) sysMutexTryLock(m)
+#define sys_mutex_unlock(m) sysMutexUnlock(m)
+
+#define sys_cond_create(c, m, a) sysCondCreate(c, m, a)
+#define sys_cond_destroy(c) sysCondDestroy(c)
+#define sys_cond_signal(c) sysCondSignal(c)
+#define sys_cond_signal_all(c) sysCondBroadcast(c)
+#define sys_cond_wait(c, t) sysCondWait(c, t)
+
+#ifndef sys_ppu_thread_get_id
+#define sys_ppu_thread_get_id sysThreadGetId
+#define sys_ppu_thread_exit sysThreadExit
+#define sys_ppu_thread_create sysThreadCreate
+#define sys_ppu_thread_join sysThreadJoin
+#define sys_ppu_thread_detach sysThreadDetach
+#endif
+
 
 /**
  * Mutexes
@@ -34,30 +82,30 @@
 
 #ifndef PS3_DEBUG_MUTEX
 
-typedef sys_lwmutex_t hts_lwmutex_t;
-
-#ifdef PS3_LW_PRIMITIVES
-typedef sys_lwmutex_t hts_mutex_t;
-#else
+typedef sys_mutex_t hts_lwmutex_t;
 typedef sys_mutex_t hts_mutex_t;
-#endif
 
 extern void hts_lwmutex_init(hts_lwmutex_t *m);
 extern void hts_lwmutex_init_recursive(hts_lwmutex_t *m);
 
 static inline void hts_lwmutex_lock(hts_lwmutex_t *m)
 {
-  sys_lwmutex_lock(m, 0);
+  if(__builtin_expect(*m == 0, 0))
+    hts_lwmutex_init(m);
+  sysMutexLock(*m, 0);
 }
 
 static inline int hts_lwmutex_trylock(hts_lwmutex_t *m)
 {
-  return !!sys_lwmutex_trylock(m);
+  if(__builtin_expect(*m == 0, 0))
+    hts_lwmutex_init(m);
+  return !!sysMutexTryLock(*m);
 }
 
 static inline void hts_lwmutex_unlock(hts_lwmutex_t *m)
 {
-  sys_lwmutex_unlock(m);
+  if(*m != 0)
+    sysMutexUnlock(*m);
 }
 
 extern void hts_lwmutex_destroy(hts_lwmutex_t *m);

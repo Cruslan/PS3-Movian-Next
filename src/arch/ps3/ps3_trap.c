@@ -68,9 +68,19 @@ load_syms(void)
 #define BT_MAX    64
 #define BT_IGNORE 1
 
+#if defined(__GNUC__) && (__GNUC__ >= 7)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-address"
+#endif
+
+/**
+ * Perform manual stack backtrace on PowerPC PPU using builtin frame & return addresses.
+ * Note: Walking beyond frame 0 is intentional for crash dump generation.
+ */
 static int
 backtrace(void **vec)
 {
+
 
 #define	BT_FRAME(i)							\
   if ((i) < BT_IGNORE + BT_MAX) {					\
@@ -159,6 +169,10 @@ backtrace(void **vec)
 	BT_FRAME(64)
 	  return 64;
 }
+#if defined(__GNUC__) && (__GNUC__ >= 7)
+#pragma GCC diagnostic pop
+#endif
+
 
 
 void

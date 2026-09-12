@@ -1158,44 +1158,101 @@ http_accept(void *opaque, int fd, const net_addr_t *local_addr,
 
 
 /**
+ * @brief Dynamic controller for bringing the embedded HTTP server up or down.
  *
+ * @details This routine controls the lifecycle of the TCP listening socket on port 42000.
+ *          In compliance with privacy and security requirements, the HTTP server defaults to
+ *          a dormant, unlistening state. When remote control or web interface settings are
+ *          enabled, this function binds the port and attaches it to the asyncio event loop.
+ *          Conversely, when remote access is revoked, it closes the listening descriptor.
+ *
+ * @param on Integer flag; non-zero to bind and listen, zero to close and tear down.
+ * @return void
+ * @complexity O(1) time complexity; operates directly on file descriptor table.
  */
-static void
-http_server_init(void)
+void
+http_server_set_enabled(int on)
 {
-  http_server_fd = asyncio_listen("http-server", 42000,
-                                  http_accept, NULL, 1);
+  if(on) {
+    /* Prevent duplicate binding if already running */
+    if(http_server_fd != NULL)
+      return;
 
-  if(gconf.http_server_ssl_key != NULL && gconf.http_server_ssl_crt != NULL) {
-    void *ctx = asyncio_ssl_create_server(gconf.http_server_ssl_key,
-                                          gconf.http_server_ssl_crt);
-    if(ctx != NULL)
-      asyncio_listen("http-server", 42443, http_accept, ctx, 1);
-  }
+    /* Step 1: Bind standard non-SSL TCP port 42000 for local network control */
+    http_server_fd = asyncio_listen("http-server", 42000,
+                                    http_accept, NULL, 1);
+
+    /* Step 2: Initialize optional TLS listener on port 42443 if SSL certificates are configured */
+    if(gconf.http_server_ssl_key != NULL && gconf.http_server_ssl_crt != NULL) {
+      void *ctx = asyncio_ssl_create_server(gconf.http_server_ssl_key,
+                                            gconf.http_server_ssl_crt);
+      if(ctx != NULL)
+        asyncio_listen("http-server", 42443, http_accept, ctx, 1);
+    }
 
 #if STOS
-  asyncio_listen("http-server", 80, http_accept, NULL, 1);
+    /* Legacy embedded platform port 80 binding */
+    asyncio_listen("http-server", 80, http_accept, NULL, 1);
 #endif
 
-  if(http_server_fd != NULL) {
-    http_server_port = asyncio_get_port(http_server_fd);
+    /* Step 3: Record bound port and initialize UPnP renderer if UPnP is enabled */
+    if(http_server_fd != NULL) {
+      http_server_port = asyncio_get_port(http_server_fd);
 
 #if ENABLE_UPNP
-    if(!gconf.disable_upnp)
-      upnp_init(http_server_port);
+      if(!gconf.disable_upnp)
+        upnp_init(http_server_port);
 #endif
+    }
+  } else {
+    /* If the server is already inactive, nothing to tear down */
+    if(http_server_fd == NULL)
+      return;
 
+    /* Gracefully unbind listening socket and remove from asyncio event loop */
+    asyncio_del_fd(http_server_fd);
+    http_server_fd = NULL;
+    http_server_port = 0;
   }
 }
 
 /**
+ * @brief Early lifecycle constructor for HTTP server subsystem.
  *
+ * @details Retained for INITME registration. To prevent unexpected incoming network
+ *          ports from opening on initial application boot, the socket is NOT bound here.
+ *          It remains dormant until explicitly brought up via http_server_set_enabled().
+ *
+ * @return void
+ * @complexity O(1)
+ */
+static void
+http_server_init(void)
+{
+  /* Subsystem initialized in dormant state by design */
+}
+
+/**
+ * @brief Subsystem destructor invoked on application shutdown or restart.
+ *
+ * @details Ensures all open websocket sessions are sent appropriate termination
+ *          frames and any active listening sockets are unlinked and freed.
+ *
+ * @return void
+ * @complexity O(N) where N is the number of active HTTP/WebSocket client connections.
  */
 static void
 http_server_fini(void)
 {
   http_connection_t *hc;
   TRACE(TRACE_DEBUG, "HTTPSERVER", "Shutdown");
+
+  /* Ensure listening socket is unlinked and torn down */
+  if(http_server_fd != NULL) {
+    asyncio_del_fd(http_server_fd);
+    http_server_fd = NULL;
+    http_server_port = 0;
+  }
 
   rstr_t *msg;
 

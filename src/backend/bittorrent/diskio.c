@@ -114,12 +114,18 @@ update_disk_usage(void)
   rstr_t *r = _("Cached torrents use %d MB out of allowed %d MB. Total free space on volume: %d MB");
 
   char tmp[256];
-  snprintf(tmp, sizeof(tmp), rstr_get(r),
-           (int)(sum / 1000000),
-           (int)(limit / 1000000),
-           (int)( btg.btg_disk_avail / 1000000));
+  const char *fmt = rstr_get(r);
+  if(fmt != NULL) {
+    snprintf(tmp, sizeof(tmp), fmt,
+             (int)(sum / 1000000),
+             (int)(limit / 1000000),
+             (int)( btg.btg_disk_avail / 1000000));
+  } else {
+    tmp[0] = '\0';
+  }
 
   prop_set_string(btg.btg_disk_status, tmp);
+
   rstr_release(r);
 }
 

@@ -21,7 +21,11 @@
 #include <stdio.h>
 #include <assert.h>
 
-#include <psl1ght/lv2.h>
+/**
+ * PPU LV2 Kernel Services Header (PSL1GHT v2):
+ * Supplies sys_process_get_params, thread status querying, and scheduler interfaces.
+ */
+#include <ppu-lv2.h>
 
 #include "main.h"
 #include "ps3.h"
@@ -276,7 +280,7 @@ start_thread(const char *name, hts_thread_t *p,
   ti->fn = fn;
   ti->aux = aux;
 
-  s32 r = sys_ppu_thread_create(p, (void *)thread_trampoline, (intptr_t)ti,
+  s32 r = sys_ppu_thread_create(p, (void *)thread_trampoline, (void *)ti,
 				prio, 131072, flags, (char *)name);
   if(r) {
     my_trace("Failed to create thread %s: error: 0x%x", name, r);
@@ -336,47 +340,255 @@ hts_thread_current(void)
 
 #ifndef PS3_DEBUG_MUTEX
 
+/**
+ * @brief Initializes an LV2 kernel mutex for hts_lwmutex_t.
+ *
+ * Implements lightweight mutex initialization by creating an LV2 system mutex
+ * (Syscall 100: sysMutexCreate) with priority inheritance and non-recursive attributes.
+ *
+ * @param m Pointer to the hts_lwmutex_t descriptor to initialize.
+ *
+ * @complexity Time: O(1) LV2 kernel transition. Space: O(1).
+ */
 void
 hts_lwmutex_init(hts_lwmutex_t *m)
 {
-  s32 r;
+  if(*m != 0)
+    return;
 
-  sys_lwmutex_attribute_t attr;
+  sys_mutex_attr_t attr;
   memset(&attr, 0, sizeof(attr));
-  attr.attr_protocol = MUTEX_PROTOCOL_PRIORITY;
-  attr.attr_recursive = MUTEX_NOT_RECURSIVE;
-  strcpy(attr.name, "mutex");
-  assert(((intptr_t)m & 7) == 0);
-  r = sys_lwmutex_create(m, &attr);
+  attr.attr_protocol = SYS_MUTEX_PROTOCOL_PRIO;
+  attr.attr_recursive = SYS_MUTEX_ATTR_NOT_RECURSIVE;
+  attr.attr_pshared   = SYS_MUTEX_ATTR_NOT_PSHARED;
+  attr.attr_adaptive  = SYS_MUTEX_ATTR_NOT_ADAPTIVE;
+  strcpy(attr.name, "lwmtx");
+
+  s32 r = sysMutexCreate(m, &attr);
   if(r)
-    panic("Failed to create mutex: error: 0x%x", r);
+    panic("Failed to create lwmutex: error: 0x%x", r);
 }
 
 
+/**
+ * @brief Initializes a recursive LV2 kernel mutex for hts_lwmutex_t.
+ *
+ * Implements recursive lightweight mutex initialization by creating an LV2 system mutex
+ * (Syscall 100: sysMutexCreate) with priority inheritance and recursive attributes.
+ *
+ * @param m Pointer to the hts_lwmutex_t descriptor to initialize.
+ *
+ * @complexity Time: O(1) LV2 kernel transition. Space: O(1).
+ */
 void
 hts_lwmutex_init_recursive(hts_lwmutex_t *m)
 {
-  s32 r;
+  if(*m != 0)
+    return;
 
-  sys_lwmutex_attribute_t attr;
+  sys_mutex_attr_t attr;
   memset(&attr, 0, sizeof(attr));
-  attr.attr_protocol = MUTEX_PROTOCOL_PRIORITY;
-  attr.attr_recursive = MUTEX_RECURSIVE;
-  strcpy(attr.name, "mutex");
-  assert(((intptr_t)m & 7) == 0);
-  r = sys_lwmutex_create(m, &attr);
+  attr.attr_protocol = SYS_MUTEX_PROTOCOL_PRIO;
+  attr.attr_recursive = SYS_MUTEX_ATTR_RECURSIVE;
+  attr.attr_pshared   = SYS_MUTEX_ATTR_NOT_PSHARED;
+  attr.attr_adaptive  = SYS_MUTEX_ATTR_NOT_ADAPTIVE;
+  strcpy(attr.name, "lwmtxr");
+
+  s32 r = sysMutexCreate(m, &attr);
   if(r)
-    panic("Failed to create recursive mutex: error: 0x%x", r);
+    panic("Failed to create recursive lwmutex: error: 0x%x", r);
 }
 
 
+/**
+ * @brief Destroys an LV2 kernel mutex associated with hts_lwmutex_t.
+ *
+ * Atomically swaps the mutex identifier to zero and invokes Syscall 101
+ * (sysMutexDestroy) on the underlying kernel mutex ID.
+ *
+ * @param m Pointer to the hts_lwmutex_t descriptor to destroy.
+ *
+ * @complexity Time: O(1) LV2 kernel transition. Space: O(1).
+ */
 void
 hts_lwmutex_destroy(hts_lwmutex_t *m)
 {
-  int r = sys_lwmutex_destroy(m);
-  if(r)
-    panic("mutex_destroy(%p) failed 0x%x", m, r);
+  sys_mutex_t mid = __atomic_exchange_n(m, 0, __ATOMIC_SEQ_CST);
+  if(mid != 0) {
+    int r = sysMutexDestroy(mid);
+    if(r)
+      panic("mutex_destroy(0x%x) failed 0x%x", mid, r);
+  }
 }
+
+
+/**
+ * @brief Native kernel-backed implementation of sysLwMutexCreate.
+ *
+ * Overrides the unresolved dynamic SPRX stub in PSL1GHT v2's liblv2.a.
+ * Maps lightweight mutex allocation directly to LV2 kernel sysMutexCreate (Syscall 100).
+ * Stores the 32-bit sys_mutex_t descriptor in mutex->sleep_queue and sets magic attribute.
+ *
+ * @param mutex Pointer to the sys_lwmutex_t structure to initialize.
+ * @param attr Pointer to lightweight mutex attributes, or NULL for defaults.
+ * @return 0 on success, or an LV2 error code.
+ * @complexity Time: O(1) LV2 kernel transition. Space: O(1).
+ */
+s32
+sysLwMutexCreate(sys_lwmutex_t *mutex, const sys_lwmutex_attr_t *attr)
+{
+  if(mutex == NULL)
+    return 0x80010002; /* CELL_EINVAL */
+
+  memset(mutex, 0, sizeof(*mutex));
+
+  sys_mutex_attr_t mattr;
+  memset(&mattr, 0, sizeof(mattr));
+  mattr.attr_protocol = SYS_MUTEX_PROTOCOL_PRIO;
+  mattr.attr_recursive = SYS_MUTEX_ATTR_NOT_RECURSIVE;
+  mattr.attr_pshared   = SYS_MUTEX_ATTR_NOT_PSHARED;
+  mattr.attr_adaptive  = SYS_MUTEX_ATTR_NOT_ADAPTIVE;
+  strncpy(mattr.name, "lwmtx", 8);
+
+  if(attr != NULL) {
+    if(attr->attr_recursive == SYS_LWMUTEX_ATTR_RECURSIVE)
+      mattr.attr_recursive = SYS_MUTEX_ATTR_RECURSIVE;
+    if(attr->attr_protocol == SYS_LWMUTEX_PROTOCOL_PRIO_INHERIT)
+      mattr.attr_protocol = SYS_MUTEX_PROTOCOL_PRIO_INHERIT;
+    if(attr->name[0] != '\0')
+      strncpy(mattr.name, attr->name, 8);
+  }
+
+  sys_mutex_t mid = 0;
+  s32 r = sysMutexCreate(&mid, &mattr);
+  if(r != 0)
+    return r;
+
+  mutex->sleep_queue = mid;
+  mutex->attribute = 0x4C574D58; /* 'LWMX' marker */
+  return 0;
+}
+
+/**
+ * @brief Native kernel-backed implementation of sysLwMutexDestroy.
+ *
+ * Overrides the unresolved dynamic SPRX stub in PSL1GHT v2's liblv2.a.
+ * Maps lightweight mutex deallocation directly to LV2 kernel sysMutexDestroy (Syscall 101).
+ *
+ * @param mutex Pointer to the sys_lwmutex_t structure.
+ * @return 0 on success, or an LV2 error code.
+ * @complexity Time: O(1) LV2 kernel transition. Space: O(1).
+ */
+s32
+sysLwMutexDestroy(sys_lwmutex_t *mutex)
+{
+  if(mutex == NULL)
+    return 0x80010002; /* CELL_EINVAL */
+
+  sys_mutex_t mid = (sys_mutex_t)mutex->sleep_queue;
+  if(mid == 0)
+    return 0x80010005; /* CELL_ESRCH */
+
+  mutex->sleep_queue = 0;
+  mutex->attribute = 0;
+  return sysMutexDestroy(mid);
+}
+
+/**
+ * @brief Native kernel-backed implementation of sysLwMutexLock.
+ *
+ * Overrides the unresolved dynamic SPRX stub in PSL1GHT v2's liblv2.a.
+ * Maps lightweight mutex locking directly to LV2 kernel sysMutexLock (Syscall 102).
+ * Automatically initializes uninitialized / zeroed mutex structures defensively.
+ *
+ * @param mutex Pointer to the sys_lwmutex_t structure.
+ * @param timeout Timeout in microseconds, or 0 for infinite wait.
+ * @return 0 on success, or an LV2 error code.
+ * @complexity Time: O(1) LV2 kernel transition. Space: O(1).
+ */
+s32
+sysLwMutexLock(sys_lwmutex_t *mutex, u64 timeout)
+{
+  if(mutex == NULL)
+    return 0x80010002; /* CELL_EINVAL */
+
+  /* Defensive lazy initialization for uninitialized/zeroed structures */
+  if(__builtin_expect(mutex->attribute != 0x4C574D58 || mutex->sleep_queue == 0, 0)) {
+    sys_lwmutex_attr_t def_attr;
+    memset(&def_attr, 0, sizeof(def_attr));
+    def_attr.attr_protocol = SYS_LWMUTEX_PROTOCOL_PRIO;
+    def_attr.attr_recursive = SYS_LWMUTEX_ATTR_RECURSIVE;
+    strcpy(def_attr.name, "autolw");
+    s32 cr = sysLwMutexCreate(mutex, &def_attr);
+    if(cr != 0)
+      return cr;
+  }
+
+  return sysMutexLock((sys_mutex_t)mutex->sleep_queue, timeout);
+}
+
+/**
+ * @brief Native kernel-backed implementation of sysLwMutexTryLock.
+ *
+ * Overrides the unresolved dynamic SPRX stub in PSL1GHT v2's liblv2.a.
+ * Maps lightweight mutex non-blocking trylock directly to LV2 kernel sysMutexTryLock (Syscall 103).
+ *
+ * @param mutex Pointer to the sys_lwmutex_t structure.
+ * @return 0 on success, or an LV2 error code.
+ * @complexity Time: O(1) LV2 kernel transition. Space: O(1).
+ */
+s32
+sysLwMutexTryLock(sys_lwmutex_t *mutex)
+{
+  if(mutex == NULL)
+    return 0x80010002; /* CELL_EINVAL */
+
+  if(__builtin_expect(mutex->attribute != 0x4C574D58 || mutex->sleep_queue == 0, 0)) {
+    sys_lwmutex_attr_t def_attr;
+    memset(&def_attr, 0, sizeof(def_attr));
+    def_attr.attr_protocol = SYS_LWMUTEX_PROTOCOL_PRIO;
+    def_attr.attr_recursive = SYS_LWMUTEX_ATTR_RECURSIVE;
+    strcpy(def_attr.name, "autolw");
+    s32 cr = sysLwMutexCreate(mutex, &def_attr);
+    if(cr != 0)
+      return cr;
+  }
+
+  return sysMutexTryLock((sys_mutex_t)mutex->sleep_queue);
+}
+
+/**
+ * @brief Native kernel-backed implementation of sysLwMutexUnlock.
+ *
+ * Overrides the unresolved dynamic SPRX stub in PSL1GHT v2's liblv2.a.
+ * Maps lightweight mutex unlocking directly to LV2 kernel sysMutexUnlock (Syscall 104).
+ *
+ * @param mutex Pointer to the sys_lwmutex_t structure.
+ * @return 0 on success, or an LV2 error code.
+ * @complexity Time: O(1) LV2 kernel transition. Space: O(1).
+ */
+s32
+sysLwMutexUnlock(sys_lwmutex_t *mutex)
+{
+  if(mutex == NULL || mutex->sleep_queue == 0)
+    return 0x80010005; /* CELL_ESRCH */
+
+  return sysMutexUnlock((sys_mutex_t)mutex->sleep_queue);
+}
+
+/* Symbol aliases ensuring both PSL1GHT and newlib internal stub invocations bind natively */
+s32 __sysLwMutexCreate(sys_lwmutex_t *mutex, const sys_lwmutex_attr_t *attr) __attribute__((alias("sysLwMutexCreate")));
+s32 __sysLwMutexDestroy(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexDestroy")));
+s32 __sysLwMutexLock(sys_lwmutex_t *mutex, u64 timeout) __attribute__((alias("sysLwMutexLock")));
+s32 __sysLwMutexTryLock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexTryLock")));
+s32 __sysLwMutexUnlock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexUnlock")));
+
+s32 sys_lwmutex_create(sys_lwmutex_t *mutex, const sys_lwmutex_attr_t *attr) __attribute__((alias("sysLwMutexCreate")));
+s32 sys_lwmutex_destroy(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexDestroy")));
+s32 sys_lwmutex_lock(sys_lwmutex_t *mutex, u64 timeout) __attribute__((alias("sysLwMutexLock")));
+s32 sys_lwmutex_trylock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexTryLock")));
+s32 sys_lwmutex_unlock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexUnlock")));
+
 
 
 

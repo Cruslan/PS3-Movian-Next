@@ -19,8 +19,5 @@
  */
 #include "glw.h"
 
-#if ENABLE_GLW_MATH_SSE
-#include "glw_math_sse.c"
-#else
+/* PS3 Cell PPE uses standard C math implementation */
 #include "glw_math_c.c"
-#endif

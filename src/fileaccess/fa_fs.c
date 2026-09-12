@@ -829,16 +829,45 @@ fs_fsinfo(struct fa_protocol *fap, const char *url, fa_fsinfo_t *ffi)
 
 #elif defined(__PPU__)
 
-#include <psl1ght/lv2.h>
+/**
+ * PPU LV2 Kernel Services Header (PSL1GHT v2):
+ * Supplies direct LV2 system call execution macro Lv2Syscall3 for querying
+ * partition statistics from the GameOS VFS.
+ */
+#include <ppu-lv2.h>
+#ifndef Lv2Syscall3
+#define Lv2Syscall3 lv2syscall3
+#endif
 
+/**
+ * @brief Queries storage metrics for the PlayStation 3 internal HDD partition.
+ *
+ * Invokes GameOS LV2 syscall 840 (sys_fs_statfs) targeting the application title directory
+ * `/dev_hdd0/game/` APPID `/` to fetch total capacity and available free byte count.
+ *
+ * @param fap Protocol handler context pointer.
+ * @param url Resource URL to inspect.
+ * @param ffi Pointer to destination filesystem information structure (size, available bytes).
+ * @return fa_err_code_t Returns 0 on success, FAP_NOT_SUPPORTED if path outside app dir,
+ *                       or FAP_ERROR on syscall failure.
+ *
+ * @complexity Time: O(1) syscall trap latency. Space: O(1).
+ */
 static fa_err_code_t
 fs_fsinfo(struct fa_protocol *fap, const char *url, fa_fsinfo_t *ffi)
 {
-  const char *path = "/dev_hdd0/game/HTSS00003/";
+  const char *path = "/dev_hdd0/game/" APPID "/";
 
-  if(mystrbegins(url, "/dev_hdd0/game/HTSS00003/") == NULL)
+  /* Ensure path begins with application installation directory */
+  if(mystrbegins(url, "/dev_hdd0/game/" APPID "/") == NULL)
     return FAP_NOT_SUPPORTED;
 
+  /*
+   * GameOS LV2 Syscall 840: sys_fs_statfs
+   * Argument 1: pointer to mount/path string
+   * Argument 2: pointer to 64-bit total capacity destination
+   * Argument 3: pointer to 64-bit available bytes destination
+   */
   int r = Lv2Syscall3(840,
                       (uint64_t)path,
                       (uint64_t)&ffi->ffi_size,

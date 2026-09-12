@@ -20,11 +20,17 @@
 #include <assert.h>
 #include <stdio.h>
 #include <sys/types.h>
+#ifdef PS3
+#include <sys/time.h>
+#include <net/poll.h>
+#else
+#include <poll.h>
+#endif
 #include <sys/socket.h>
 #include <unistd.h>
-#include <poll.h>
 #include <errno.h>
 #include <netinet/in.h>
+
 
 #include "main.h"
 #include "arch/arch.h"

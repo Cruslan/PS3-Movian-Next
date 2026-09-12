@@ -36,11 +36,29 @@
 
 
 #include <sysmodule/sysmodule.h>
-#include <psl1ght/lv2.h>
-#include <psl1ght/lv2/spu.h>
-#include <lv2/process.h>
+#include <sys/event_queue.h>
 
-#include <rtc.h>
+/**
+ * PPU LV2 Kernel Services & SPU Management (PSL1GHT v2):
+ * Provides low-level LV2 syscalls and SPU thread allocation controls for the CBE.
+ */
+#include <ppu-lv2.h>
+#include <lv2/spu.h>
+#include <lv2/process.h>
+#include <time.h>
+
+#ifndef SysLoadModule
+#define SysLoadModule sysModuleLoad
+#endif
+#ifndef sys_ppu_thread_get_id
+#define sys_ppu_thread_get_id sysThreadGetId
+#endif
+#ifndef sys_ppu_thread_create
+#define sys_ppu_thread_create sysThreadCreate
+#endif
+#ifndef sys_event_queue_receive
+#define sys_event_queue_receive sysEventQueueReceive
+#endif
 
 #include "arch/threads.h"
 #include "arch/atomic.h"
@@ -57,6 +75,17 @@
 #include "ps3.h"
 
 extern int sysUtilGetSystemParamInt(int, int *);
+
+/**
+ * @brief Web browser visibility state flag.
+ *
+ * In legacy PSL1GHT v1 builds, this symbol was exported by ps3_webpopup.c
+ * through the Sony sysutil web browser overlay API (<sysutil/web.h>).
+ * In modern PSL1GHT v2, proprietary web overlay headers have been deprecated.
+ * This flag is defined here and defaulted to 0 (hidden) to satisfy the linker
+ * dependency referenced by the glw_ps3 rendering pipeline without overhead.
+ */
+int browser_visible = 0;
 
 static void replace_gamefile(const char *name);
 
@@ -186,7 +215,7 @@ memlogger_fn(callout_t *co, void *aux)
   uint64_t size, avail;
 
   int r = Lv2Syscall3(840,
-                      (uint64_t)"/dev_hdd0/game/HTSS00003/",
+                      (uint64_t)"/dev_hdd0/game/" APPID "/",
                       (uint64_t)&size,
                       (uint64_t)&avail);
 
@@ -231,9 +260,10 @@ scan_root_fs(callout_t *co, void *aux)
   struct dirent *d;
   struct stat st;
   DIR *dir;
-  char fname[32];
-  char dpyname[32];
+  char fname[1050];
+  char dpyname[64];
   rootfsnode_t *rfn, *next;
+
 
   LIST_FOREACH(rfn, &rootfsnodes, link)
     rfn->mark = 1;
@@ -268,17 +298,15 @@ scan_root_fs(callout_t *co, void *aux)
 
       const char *name = d->d_name;
       const char *type = "other";
-      const char *desc;
       if(!strcmp(name, "dev_hdd0")) {
 	name = "PS3 HDD";
-	desc = "Internal Harddrive";
       } else if(!strncmp(name, "dev_usb", strlen("dev_usb"))) {
 	snprintf(dpyname, sizeof(dpyname), "USB Drive %d",
 		 atoi(name + strlen("dev_usb")));
 	type = "usb";
 	name = dpyname;
-	desc = "External Harddrive";
       }
+
       else if(!strcmp(name, "dev_bdvd") ||
 	      !strcmp(name, "dev_ps2disc")) {
 	name = "BluRay Drive";
@@ -355,11 +383,21 @@ my_trace(const char *fmt, ...)
 }
 
 /**
+ * @brief Platform-specific diagnostic trace output routine for PS3.
  *
+ * Directs logging output to standard console output (stdout) with immediate flushing,
+ * ensuring all engine diagnostic logs (themes, universe hierarchy, RSX state, fonts)
+ * appear in real time on the RPCS3 TTY terminal and hardware debugger consoles.
+ *
+ * @param level Diagnostic severity level.
+ * @param prefix Subsystem tag prefix (e.g. "RSX", "GLW", "NAV").
+ * @param str Formatted diagnostic message string.
  */
 void
 trace_arch(int level, const char *prefix, const char *str)
 {
+  printf("[%s] %s\n", prefix, str);
+  fflush(stdout);
 }
 
 
@@ -564,27 +602,27 @@ set_device_id(void)
 
 
 /**
+ * @brief Converts epoch time to local calendar time using POSIX standard localtime_r.
  *
+ * Replaces the deprecated Sony/PSL1GHT v1 rtc.h conversion pipeline (rtc_convert_time_to_datetime,
+ * rtc_convert_utc_to_localtime) with standard C reentrant calendar calculation.
+ *
+ * @param now Pointer to the source UNIX epoch time in seconds.
+ * @param tm Destination pointer to the broken-down calendar time structure.
+ *
+ * @complexity Time: O(1). Space: O(1).
  */
 void
 arch_localtime(const time_t *now, struct tm *tm)
 {
-  rtc_datetime dt;
-  rtc_tick utc, local;
+  if(now == NULL || tm == NULL)
+    return;
 
-  rtc_convert_time_to_datetime(&dt, *now);
-  rtc_convert_datetime_to_tick(&dt, &utc);
-  rtc_convert_utc_to_localtime(&utc, &local);
-  rtc_convert_tick_to_datetime(&dt, &local);
-
-  memset(tm, 0, sizeof(struct tm));
-
-  tm->tm_year = dt.year - 1900;
-  tm->tm_mon  = dt.month - 1;
-  tm->tm_mday = dt.day;
-  tm->tm_hour = dt.hour;
-  tm->tm_min  = dt.minute;
-  tm->tm_sec  = dt.second;
+  /*
+   * Convert seconds since epoch into broken-down time format according
+   * to current system timezone configured in GameOS XMB settings.
+   */
+  localtime_r(now, tm);
 }
 
 
@@ -622,11 +660,7 @@ exec_catcher(void *aux)
   return NULL;
 }
 
-typedef struct sys_event_queue_attr {
-  uint32_t attr_protocol;
-  int type;
-  char name[8];
-} sys_event_queue_attribute_t;
+typedef sys_event_queue_attr_t sys_event_queue_attribute_t;
 
 
 static int no_sfo_overwrite;
@@ -690,6 +724,8 @@ main(int argc, char **argv)
 
   r = sys_ppu_thread_create(&tid, (void *)exec_catcher, 0,
 			    2, 16384, 0, (char *)"execcatcher");
+  (void)r;
+
 
   preload_fonts();
 

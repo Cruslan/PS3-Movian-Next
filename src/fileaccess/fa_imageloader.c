@@ -50,6 +50,11 @@ static const uint8_t gif87sig[6] = {'G', 'I', 'F', '8', '7', 'a'};
 static const uint8_t svgsig1[5] = {'<', '?', 'x', 'm', 'l'};
 static const uint8_t svgsig2[4] = {'<', 's', 'v', 'g'};
 
+static const uint8_t webpsig[4] = {'W', 'E', 'B', 'P'};
+static const uint8_t ddssig[4] = {'D', 'D', 'S', ' '};
+static const uint8_t tiffsig_le[4] = {'I', 'I', 42, 0};
+static const uint8_t tiffsig_be[4] = {'M', 'M', 0, 42};
+
 #if ENABLE_LIBAV
 static hts_mutex_t image_from_video_mutex[2];
 static AVCodecContext *thumbctx;
@@ -120,6 +125,30 @@ fa_imageloader_buf(buf_t *buf, char *errbuf, size_t errlen)
   } else if(!memcmp(svgsig1, p, sizeof(svgsig1)) ||
 	    !memcmp(svgsig2, p, sizeof(svgsig2))) {
     fmt = IMAGE_SVG;
+  } else if(buf->b_size >= 12 && !memcmp(p, "RIFF", 4) && !memcmp(p + 8, webpsig, sizeof(webpsig))) {
+    /* Google WebP container (RIFF....WEBP) */
+    fmt = IMAGE_WEBP;
+  } else if(buf->b_size >= 4 && !memcmp(p, ddssig, sizeof(ddssig))) {
+    /* Microsoft DirectDraw Surface container ('DDS ') */
+    fmt = IMAGE_DDS;
+  } else if(buf->b_size >= 4 && (!memcmp(p, tiffsig_le, sizeof(tiffsig_le)) ||
+                                 !memcmp(p, tiffsig_be, sizeof(tiffsig_be)))) {
+    /* Tagged Image File Format (TIFF - II42 Little-Endian or MM042 Big-Endian) */
+    fmt = IMAGE_TIFF;
+  } else if(buf->b_size >= 18 && (p[2] == 1 || p[2] == 2 || p[2] == 3 ||
+                                  p[2] == 9 || p[2] == 10 || p[2] == 11) &&
+            (p[1] == 0 || p[1] == 1)) {
+    /* Truevision Targa (TGA - Uncompressed & RLE True-color/Grayscale/Color-mapped) */
+    uint16_t tga_w = p[12] | (p[13] << 8);
+    uint16_t tga_h = p[14] | (p[15] << 8);
+    uint8_t tga_bpp = p[16];
+    if(tga_w > 0 && tga_h > 0 && (tga_bpp == 8 || tga_bpp == 15 || tga_bpp == 16 || tga_bpp == 24 || tga_bpp == 32)) {
+      fmt = IMAGE_TGA;
+      width = tga_w;
+      height = tga_h;
+    } else {
+      goto bad;
+    }
   } else {
   bad:
     snprintf(errbuf, errlen, "Unknown format");
@@ -187,7 +216,7 @@ fa_imageloader(const char *url, const struct image_meta *im,
 	       int *cache_control, cancellable_t *c,
                backend_t *be)
 {
-  uint8_t p[16];
+  uint8_t p[32];
   int r;
   int width = -1, height = -1, orientation = 0;
   fa_handle_t *fh;
@@ -219,7 +248,8 @@ fa_imageloader(const char *url, const struct image_meta *im,
                             &foe)) == NULL)
     return NULL;
 
-  if(fa_read(fh, p, sizeof(p)) != sizeof(p)) {
+  r = fa_read(fh, p, sizeof(p));
+  if(r < 16) {
     snprintf(errbuf, errlen, "File too short");
     fa_close(fh);
     return NULL;
@@ -281,6 +311,32 @@ fa_imageloader(const char *url, const struct image_meta *im,
   } else if(!memcmp(svgsig1, p, sizeof(svgsig1)) ||
 	    !memcmp(svgsig2, p, sizeof(svgsig2))) {
     fmt = IMAGE_SVG;
+  } else if(!memcmp(p, "RIFF", 4) && !memcmp(p + 8, webpsig, sizeof(webpsig))) {
+    /* Google WebP container (RIFF....WEBP) */
+    fmt = IMAGE_WEBP;
+  } else if(!memcmp(p, ddssig, sizeof(ddssig))) {
+    /* Microsoft DirectDraw Surface container ('DDS ') */
+    fmt = IMAGE_DDS;
+  } else if(!memcmp(p, tiffsig_le, sizeof(tiffsig_le)) ||
+            !memcmp(p, tiffsig_be, sizeof(tiffsig_be))) {
+    /* Tagged Image File Format (TIFF - II42 Little-Endian or MM042 Big-Endian) */
+    fmt = IMAGE_TIFF;
+  } else if(r >= 18 && (p[2] == 1 || p[2] == 2 || p[2] == 3 ||
+                        p[2] == 9 || p[2] == 10 || p[2] == 11) &&
+            (p[1] == 0 || p[1] == 1)) {
+    /* Truevision Targa (TGA - Uncompressed & RLE True-color/Grayscale/Color-mapped) */
+    uint16_t tga_w = p[12] | (p[13] << 8);
+    uint16_t tga_h = p[14] | (p[15] << 8);
+    uint8_t tga_bpp = p[16];
+    if(tga_w > 0 && tga_h > 0 && (tga_bpp == 8 || tga_bpp == 15 || tga_bpp == 16 || tga_bpp == 24 || tga_bpp == 32)) {
+      fmt = IMAGE_TGA;
+      width = tga_w;
+      height = tga_h;
+    } else {
+      snprintf(errbuf, errlen, "Unknown format");
+      fa_close(fh);
+      return NULL;
+    }
   } else {
     snprintf(errbuf, errlen, "Unknown format");
     fa_close(fh);

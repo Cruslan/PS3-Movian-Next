@@ -609,12 +609,18 @@ siblings_populate(void *opaque, prop_event_t event, ...)
   case PROP_REQ_MOVE_CHILD:
   case PROP_REQ_DELETE:
   case PROP_SELECT_CHILD:
+  case PROP_SUGGEST_FOCUS:
+  case PROP_DESTROYED:
+  case PROP_SUBSCRIPTION_MONITOR_ACTIVE:
     break;
 
   default:
-    fprintf(stderr, "siblings_populate(): Can't handle event %d, aborting\n",
-	    event);
-    abort();
+    /**
+     * Non-fatal property events (e.g. dynamic UI layout notifications, focus shifts)
+     * should not cause fatal application aborts. Simply log and safely ignore.
+     */
+    TRACE(TRACE_DEBUG, "playqueue", "siblings_populate: ignoring unhandled prop event %d", event);
+    break;
   }
 }
 

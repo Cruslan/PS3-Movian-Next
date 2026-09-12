@@ -387,6 +387,12 @@ static struct strtab postfixtab[] = {
   { "png",             CONTENT_IMAGE },
   { "gif",             CONTENT_IMAGE },
   { "svg",             CONTENT_IMAGE },
+  { "bmp",             CONTENT_IMAGE },
+  { "webp",            CONTENT_IMAGE },
+  { "tif",             CONTENT_IMAGE },
+  { "tiff",            CONTENT_IMAGE },
+  { "dds",             CONTENT_IMAGE }, /* DirectDraw Surface container texture */
+  { "tga",             CONTENT_IMAGE }, /* Truevision Targa image */
 
   { "mp3",             CONTENT_AUDIO },
   { "m4a",             CONTENT_AUDIO },
@@ -396,6 +402,18 @@ static struct strtab postfixtab[] = {
   { "ogg",             CONTENT_AUDIO },
   { "spc",             CONTENT_AUDIO },
   { "wav",             CONTENT_AUDIO },
+  { "dts",             CONTENT_AUDIO },
+  { "dtshd",           CONTENT_AUDIO },
+  { "ac3",             CONTENT_AUDIO },
+  { "eac3",            CONTENT_AUDIO },
+  { "opus",            CONTENT_AUDIO },
+  { "mka",             CONTENT_AUDIO },
+  { "wv",              CONTENT_AUDIO },
+  { "ape",             CONTENT_AUDIO },
+  { "tta",             CONTENT_AUDIO },
+  { "mlp",             CONTENT_AUDIO },
+  { "thd",             CONTENT_AUDIO },
+  { "mp2",             CONTENT_AUDIO },
 
   { "mkv",             CONTENT_VIDEO },
   { "avi",             CONTENT_VIDEO },
@@ -406,6 +424,14 @@ static struct strtab postfixtab[] = {
   { "wmv",             CONTENT_VIDEO },
   { "mp4",             CONTENT_VIDEO },
   { "mts",             CONTENT_VIDEO },
+  { "m2ts",            CONTENT_VIDEO },
+  { "webm",            CONTENT_VIDEO },
+  { "flv",             CONTENT_VIDEO },
+  { "vob",             CONTENT_VIDEO },
+  { "m2v",             CONTENT_VIDEO },
+  { "dv",              CONTENT_VIDEO },
+  { "asf",             CONTENT_VIDEO },
+  { "ogv",             CONTENT_VIDEO },
 
   { "sid",             CONTENT_ALBUM },
 

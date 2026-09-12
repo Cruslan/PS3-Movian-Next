@@ -164,10 +164,14 @@ net_resolve(const char *hostname, net_addr_t *addr, const char **err)
   switch(hp->h_addrtype) {
   case AF_INET:
     addr->na_family = 4;
-    lv2_void* netaddrlist = (lv2_void*)(u64)hp->h_addr_list;
-    memcpy(&addr->na_addr[0], (char*)(u64)netaddrlist[0],
-           sizeof(struct in_addr));
+    u32 *netaddrlist = (u32 *)(uintptr_t)hp->h_addr_list;
+    if(netaddrlist != NULL && netaddrlist[0] != 0) {
+      memcpy(&addr->na_addr[0], (void *)(uintptr_t)netaddrlist[0],
+             sizeof(struct in_addr));
+    }
     return 0;
+
+
 
   default:
     *err = "Invalid protocol family";

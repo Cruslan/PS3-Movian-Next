@@ -115,6 +115,15 @@ static const struct {
   { "application/ogg", "ogg" },
   { "audio/aac", "aac" },
   { "audio/aacp", "aac" },
+  { "audio/dts", "dts" },
+  { "audio/x-dts", "dts" },
+  { "audio/vnd.dts", "dts" },
+  { "audio/vnd.dts.hd", "dts" },
+  { "audio/ac3", "ac3" },
+  { "audio/x-ac3", "ac3" },
+  { "audio/eac3", "eac3" },
+  { "audio/flac", "flac" },
+  { "audio/x-flac", "flac" },
 };
 
 
@@ -145,10 +154,34 @@ fa_libav_open_format(AVIOContext *avio, const char *url,
 	    url, mimetype);
   }
 
+  /*
+   * Extension-based format fallback if MIME lookup was ambiguous or absent.
+   * Direct format detection completely bypasses syncword scanning ambiguities
+   * (e.g. distinguishing raw DTS from spurious MP3 syncwords).
+   */
+  if(fmt == NULL && url != NULL) {
+    const char *ext = strrchr(url, '.');
+    if(ext != NULL) {
+      if(!strcasecmp(ext, ".dts") || !strcasecmp(ext, ".dtshd")) {
+        fmt = av_find_input_format("dts");
+      } else if(!strcasecmp(ext, ".ac3")) {
+        fmt = av_find_input_format("ac3");
+      } else if(!strcasecmp(ext, ".eac3")) {
+        fmt = av_find_input_format("eac3");
+      }
+    }
+  }
+
   int probe_size = 0;
   switch(strategy) {
   case FA_LIBAV_OPEN_STRATEGY_AUDIO:
-    probe_size = 4096;
+    /*
+     * Increased from 4096 to 65536 bytes. High-bitrate audio bitstreams such as DTS
+     * require finding multiple consecutive frame headers (at least 4 in dtsdec.c).
+     * In a 4KB window, DTS frames exceed buffer bounds, causing probe scores of 0
+     * and false matches to MP3 sync words.
+     */
+    probe_size = 65536;
     break;
   case FA_LIBAV_OPEN_STRATEGY_VIDEO_NON_SEEKABLE:
     probe_size = 65536;

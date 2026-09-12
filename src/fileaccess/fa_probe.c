@@ -33,6 +33,7 @@
 #include "misc/str.h"
 #include "misc/isolang.h"
 #include "image/jpeg.h"
+#include "metadata/metadata.h"
 #include "htsmsg/htsmsg_json.h"
 
 #if ENABLE_LIBAV
@@ -88,6 +89,9 @@ codecname(enum AVCodecID id)
 static const uint8_t pngsig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
 static const uint8_t isosig[8] = {0x1, 0x43, 0x44, 0x30, 0x30, 0x31, 0x1, 0x0};
 static const uint8_t gifsig[6] = {'G', 'I', 'F', '8', '9', 'a'};
+static const uint8_t gif87sig[6] = {'G', 'I', 'F', '8', '7', 'a'};
+static const uint8_t webpsig[4] = {'W', 'E', 'B', 'P'};
+static const uint8_t ddssig[4] = {'D', 'D', 'S', ' '};
 static const uint8_t ttfsig[5] = {0,1,0,0,0};
 static const uint8_t otfsig[4] = {'O', 'T', 'T', 'O'};
 static const uint8_t pdfsig[] = {'%', 'P', 'D', 'F', '-'};
@@ -326,17 +330,55 @@ fa_probe_header(metadata_t *md, const char *url, fa_handle_t *fh,
     return 1;
   }
 
-  if(buf[0] == 'B' && buf[1] == 'M') {
-    /* BMP */
-    uint32_t siz = buf[2] | (buf[3] << 8) | (buf[4] << 16) | (buf[5] << 24);
-    if(siz == fa_fsize(fh)) {
+  if(l >= 14 && buf[0] == 'B' && buf[1] == 'M') {
+    /*
+     * Windows Bitmap (BMP):
+     * Starts with 'BM' magic followed by a 14-byte BITMAPFILEHEADER.
+     * Recognize immediately as CONTENT_IMAGE without relying on strict file size match,
+     * ensuring padded, streamed, or zero-bfSize BMPs are reliably classified.
+     */
+    md->md_contenttype = CONTENT_IMAGE;
+    return 1;
+  }
+
+  const char *tga_dot = filename ? strrchr(filename, '.') : (url ? strrchr(url, '.') : NULL);
+  if(tga_dot != NULL && (!strcasecmp(tga_dot, ".tga")) && l >= 18) {
+    /*
+     * Truevision TGA (Targa):
+     * Verified by .tga extension and valid TGA image type in header byte 2
+     * (1, 2, 3 = uncompressed color-mapped, true-color RGB, grayscale;
+     *  9, 10, 11 = RLE color-mapped, true-color RGB, grayscale).
+     */
+    uint8_t img_type = buf[2];
+    if(img_type == 1 || img_type == 2 || img_type == 3 ||
+       img_type == 9 || img_type == 10 || img_type == 11) {
       md->md_contenttype = CONTENT_IMAGE;
       return 1;
     }
   }
 
-  if(!memcmp(buf, gifsig, sizeof(gifsig))) {
-    /* GIF */
+  if(!memcmp(buf, gifsig, sizeof(gifsig)) ||
+     !memcmp(buf, gif87sig, sizeof(gif87sig))) {
+    /* GIF (GIF89a or legacy GIF87a paletted raster image) */
+    md->md_contenttype = CONTENT_IMAGE;
+    return 1;
+  }
+
+  if(l >= 12 && !memcmp(buf, "RIFF", 4) && !memcmp(buf + 8, webpsig, sizeof(webpsig))) {
+    /* Google WebP raster image */
+    md->md_contenttype = CONTENT_IMAGE;
+    return 1;
+  }
+
+  if(l >= 4 && ((buf[0] == 'I' && buf[1] == 'I' && buf[2] == 42 && buf[3] == 0) ||
+                (buf[0] == 'M' && buf[1] == 'M' && buf[2] == 0 && buf[3] == 42))) {
+    /* Tagged Image File Format (TIFF - Little or Big Endian) */
+    md->md_contenttype = CONTENT_IMAGE;
+    return 1;
+  }
+
+  if(l >= 4 && !memcmp(buf, ddssig, sizeof(ddssig))) {
+    /* Microsoft DirectDraw Surface (DDS) texture container */
     md->md_contenttype = CONTENT_IMAGE;
     return 1;
   }
@@ -491,7 +533,8 @@ fa_lavf_load_meta(metadata_t *md, AVFormatContext *fctx,
 
       switch(avctx->codec_type) {
       case AVMEDIA_TYPE_VIDEO:
-	has_video = !!codec;
+	/* Any video stream marks the container as video, ensuring unsupported video codecs (e.g. AV1) are not treated as audio */
+	has_video = 1;
 	tn = ++vtrack;
 	break;
       case AVMEDIA_TYPE_AUDIO:
@@ -593,6 +636,17 @@ fa_probe_metadata(const char *url, char *errbuf, size_t errsize,
   fa_seek(fh, 0, SEEK_SET);
 
   if(!fa_probe_iso(md, fh)) {
+    fa_close_with_park(fh, park);
+    return md;
+  }
+
+  if(contenttype_from_filename(filename ? filename : url) == CONTENT_IMAGE) {
+    /*
+     * If the file extension matches an image format (.tiff, .tif, .dds, .tga, .bmp, .webp, .png, .jpg, .gif, .svg),
+     * strictly guard against Libav's overly eager MP3 audio probing heuristics.
+     * Set contenttype to CONTENT_IMAGE immediately and return.
+     */
+    md->md_contenttype = CONTENT_IMAGE;
     fa_close_with_park(fh, park);
     return md;
   }

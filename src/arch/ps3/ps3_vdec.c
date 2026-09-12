@@ -18,11 +18,112 @@
  *  For more information, contact andreas@lonelycoder.com
  */
 #include <stdio.h>
+#include <unistd.h>
 #include <codec/vdec.h>
+#include <ppu-asm.h>
 #include <assert.h>
 
 #include <sysmodule/sysmodule.h>
-#include <psl1ght/lv2.h>
+
+/**
+ * @brief Accurate H.264 Video Decoder Information Descriptor (CellVdecAvcInfo).
+ *
+ * PSL1GHT v2's <codec/vdec.h> erroneously defines pic_order_count as `s8 pic_order_count[2]`
+ * at offset 0x0D instead of `s16 picOrderCount[2]` at offset 0x0E (following 1-byte padding).
+ * That misalignment shifts every single subsequent field by 3 bytes, corrupting
+ * vui_parameters_present_flag, frame_mbs_only_flag, matrix_coefficients, and nalUnitPresentFlags.
+ * This structure strictly mirrors Sony's official CellVdecAvcInfo and RPCS3's HLE implementation.
+ */
+typedef struct ps3_vdec_h264_info {
+  uint16_t width;                           /**< 0x00: Decoded picture horizontal size */
+  uint16_t height;                          /**< 0x02: Decoded picture vertical size */
+  uint8_t  picture_type[2];                 /**< 0x04: AVC picture type (I, P, B, UNKNOWN) */
+  uint8_t  idr_picture_flag;                /**< 0x06: Instantaneous Decoder Refresh indicator */
+  uint8_t  aspect_ratio_idc;                /**< 0x07: Sample aspect ratio indicator */
+  uint16_t sar_height;                      /**< 0x08: SAR vertical component */
+  uint16_t sar_width;                       /**< 0x0a: SAR horizontal component */
+  uint8_t  pic_struct;                      /**< 0x0c: Picture structure (Frame, Top, Bottom, etc.) */
+  uint8_t  _pad0;                           /**< 0x0d: Required alignment padding */
+  int16_t  pic_order_count[2];              /**< 0x0e: Picture Order Count (POC) for top/bottom fields */
+  uint8_t  vui_parameters_present_flag;     /**< 0x12: VUI parameter flag */
+  uint8_t  frame_mbs_only_flag;             /**< 0x13: 1 if progressive, 0 if MBAFF or field coding */
+  uint8_t  video_signal_type_present_flag;  /**< 0x14: Video signal type flag */
+  uint8_t  video_format;                    /**< 0x15: Video format (NTSC, PAL, Component, etc.) */
+  uint8_t  video_full_range_flag;           /**< 0x16: Color range (0 = limited 16-235, 1 = full 0-255) */
+  uint8_t  color_description_present_flag;  /**< 0x17: Color description presence */
+  uint8_t  color_primaries;                 /**< 0x18: Color primaries code */
+  uint8_t  transfer_characteristics;        /**< 0x19: Transfer characteristics code */
+  uint8_t  matrix_coefficients;             /**< 0x1a: Matrix coefficients (BT.709, BT.601, SMPTE240M) */
+  uint8_t  timing_info_present_flag;        /**< 0x1b: Timing info presence */
+  uint8_t  frame_rate;                      /**< 0x1c: AVC universal frame rate code */
+  uint8_t  fixed_frame_rate_flag;           /**< 0x1d: Fixed frame rate flag */
+  uint8_t  low_delay_hrd_flag;              /**< 0x1e: Low delay HRD flag */
+  uint8_t  entropy_coding_mode_flag;        /**< 0x1f: 0 = CAVLC, 1 = CABAC */
+  uint16_t nalUnitPresentFlags;             /**< 0x20: Bitmask of present NAL units */
+  uint8_t  ccDataLength[2];                 /**< 0x22: Closed Caption data lengths */
+  uint8_t  ccData[2][128];                  /**< 0x24: Closed Caption data payloads */
+  uint64_t reserved[2];                     /**< 0x128: Alignment padding / reserved words */
+} ps3_vdec_h264_info_t;
+
+/**
+ * @brief Initializes a 32-bit Function Descriptor (OPD32) from a 64-bit function pointer.
+ *
+ * In 64-bit PowerPC ILP32 ABI, a C function pointer points to a 64-bit OPD entry:
+ * [func: 64-bit, rtoc: 64-bit, env: 64-bit]. Both RPCS3's HLE Video Decoder (vdecEntry)
+ * and Cell OS libvdec treat cbFunc as a 32-bit OPD pointer {uint32_t addr, uint32_t rtoc}.
+ * Storing the lower 32-bit function address and RTOC into an aligned opd32 struct
+ * guarantees valid branch targets on all callback dispatches (SEQDONE, PICOUT, AUDONE).
+ *
+ * @param out_opd Destination 32-bit OPD descriptor structure.
+ * @param func_ptr Function pointer to convert (points to 64-bit OPD table entry).
+ * @return 32-bit address suitable for Cell OS / RPCS3 callback dispatch.
+ */
+static inline uint32_t init_opd32(opd32 *out_opd, void *func_ptr)
+{
+  const uint64_t *opd = (const uint64_t *)func_ptr;
+  out_opd->func = (uint32_t)opd[0];
+  out_opd->rtoc = (uint32_t)opd[1];
+  return (uint32_t)(uintptr_t)out_opd;
+}
+
+#define vdec_type _vdec_type
+#define vdec_attr _vdec_attr
+#define vdec_config _vdec_config
+#define vdec_closure _vdec_closure
+#define vdec_au _vdec_au
+#define vdec_picture _vdec_picture
+#define vdec_picture_format _vdec_picture_format
+#define vdec_mpeg2_info _vdec_mpeg2_info
+#define vdec_h264_info ps3_vdec_h264_info_t
+
+typedef struct _vdec_type _vdec_type;
+typedef struct _vdec_attr _vdec_attr;
+typedef struct _vdec_config _vdec_config;
+typedef struct _vdec_closure _vdec_closure;
+typedef struct _vdec_au _vdec_au;
+typedef struct _vdec_picture _vdec_picture;
+typedef struct _vdec_picture_format _vdec_picture_format;
+typedef struct _vdec_mpeg2_info _vdec_mpeg2_info;
+
+
+
+#define vdec_query_attr vdecQueryAttr
+#define vdec_open vdecOpen
+#define vdec_close vdecClose
+#define vdec_start_sequence vdecStartSequence
+#define vdec_end_sequence vdecEndSequence
+#define vdec_decode_au vdecDecodeAu
+#define vdec_get_picture vdecGetPicture
+#define vdec_get_pic_item vdecGetPicItem
+#ifndef SysLoadModule
+#define SysLoadModule sysModuleLoad
+#endif
+
+/**
+ * PPU LV2 Kernel Services Header (PSL1GHT v2):
+ * Supplies LV2 process and syscall interfaces for hardware video decoding (libvdec).
+ */
+#include <ppu-lv2.h>
 
 #include "arch/threads.h"
 #include "main.h"
@@ -33,6 +134,7 @@
 #include "video/video_settings.h"
 #include "video/h264_annexb.h"
 #include "video/h264_parser.h"
+#include "ui/glw/glw_rsx.h"
 
 #define VDEC_DETAILED_DEBUG 0
 
@@ -123,6 +225,41 @@ typedef struct vdec_decoder {
   int do_flush;
 
   int crop_right, crop_bottom;
+
+  /**
+   * @brief Dynamic buffer used to concatenate H.264 extradata (SPS/PPS NAL units)
+   * directly with the initial video frame Access Unit (AU).
+   *
+   * In H.264 video decoding architecture under Cell OS / RPCS3 HLE (libvdec),
+   * submitting parameter sets (SPS/PPS) as an isolated standalone Access Unit
+   * without an accompanying VCL slice causes FFmpeg/cellVdec to fail with
+   * "no frame!" and emit fatal error 0xbebbb1b7 (AVERROR_INVALIDDATA),
+   * permanently killing the decoder thread.
+   *
+   * By prepending extradata into this contiguous scratch buffer prior to AU submission,
+   * the first Access Unit delivers a fully formed [SPS][PPS][VCL Slice] stream,
+   * satisfying both the H.264 specification and cellVdec invariants.
+   */
+  /**
+   * @brief 32-bit Function OPD Descriptor for Cell OS / RPCS3 HLE Callback Dispatch.
+   *
+   * Stores the 32-bit function address and RTOC for decoder_callback, guaranteeing
+   * valid branch execution on all callback notifications (SEQDONE, PICOUT, AUDONE).
+   */
+  opd32 cb_opd;
+
+  /**
+   * @brief Consecutive picture counter with all-zero Picture Order Count (POC).
+   *
+   * In RPCS3's HLE cellVdec implementation (and certain streams without POC metadata),
+   * picOrderCount[0] is permanently reported as 0. When two consecutive pictures report
+   * zero POC, h264_monotonic is activated to guarantee smooth frame queue draining.
+   */
+  int h264_zero_poc_count;
+  int h264_monotonic;
+
+  uint8_t *au_buf;
+  size_t au_buf_size;
 
 } vdec_decoder_t;
 
@@ -337,11 +474,19 @@ picture_out(vdec_decoder_t *vdd)
     vdd->max_order = -1;
   }
 
-  int64_t pts = pm->nopts ? AV_NOPTS_VALUE : 
-    pi->pts[0].low + ((uint64_t)pi->pts[0].hi << 32);
+  int64_t pts;
+  if(pm->nopts || (pi->pts[0].low == 0xffffffff && pi->pts[0].hi == 0xffffffff)) {
+    pts = AV_NOPTS_VALUE;
+  } else {
+    pts = ((uint64_t)pi->pts[0].low << 32) | (uint32_t)pi->pts[0].hi;
+  }
 
-  int64_t dts = pm->nodts ? AV_NOPTS_VALUE : 
-    pi->dts[0].low + ((uint64_t)pi->dts[0].hi << 32);
+  int64_t dts;
+  if(pm->nodts || (pi->dts[0].low == 0xffffffff && pi->dts[0].hi == 0xffffffff)) {
+    dts = AV_NOPTS_VALUE;
+  } else {
+    dts = ((uint64_t)pi->dts[0].low << 32) | (uint32_t)pi->dts[0].hi;
+  }
   int64_t order;
 
   if(pi->codec_type == VDEC_CODEC_TYPE_MPEG2) {
@@ -457,24 +602,44 @@ picture_out(vdec_decoder_t *vdd)
       vp->fi.fi_dar_den *= p[1];
     }
 
-    if(h264->idr_picture_flag) {
-      vdd->order_base += 0x100000000LL;
-      vdd->poc_ext = 0;
-    }
-
-    uint32_t om = h264->pic_order_count[0] & 0x7fff;
-
-    int p = om >> 13;
-    if(p == ((vdd->poc_ext + 1) & 3)) {
-      vdd->poc_ext = p;
-      if(p == 0)
-	vdd->order_base += 0x100000000LL;
-    }
-
-    if(p == 3 && vdd->poc_ext == 0) {
-      order = vdd->order_base + om - 0x100000000LL;
+    if(h264->pic_order_count[0] == 0 && h264->pic_order_count[1] == 0) {
+      vdd->h264_zero_poc_count++;
+      if(vdd->h264_zero_poc_count >= 2)
+        vdd->h264_monotonic = 1;
     } else {
-      order = vdd->order_base + om;
+      vdd->h264_zero_poc_count = 0;
+    }
+
+    if(vdd->h264_monotonic) {
+      /* Monotonic frame ordering when POC is unavailable (e.g. RPCS3 HLE or all-zero POC bitstreams).
+       * Advances strictly past max_order to ensure smooth frame queue draining without starvation. */
+      if(vdd->max_order >= 0) {
+        order = vdd->max_order + 1;
+      } else {
+        order = 0;
+      }
+      vdd->order_base = order + 1;
+    } else {
+      /* Real PS3 hardware decode-order reordering using ITU-T H.264 POC */
+      if(h264->idr_picture_flag) {
+        vdd->order_base += 0x100000000LL;
+        vdd->poc_ext = 0;
+      }
+
+      uint32_t om = (uint16_t)h264->pic_order_count[0] & 0x7fff;
+
+      int p = om >> 13;
+      if(p == ((vdd->poc_ext + 1) & 3)) {
+        vdd->poc_ext = p;
+        if(p == 0)
+          vdd->order_base += 0x100000000LL;
+      }
+
+      if(p == 3 && vdd->poc_ext == 0) {
+        order = vdd->order_base + om - 0x100000000LL;
+      } else {
+        order = vdd->order_base + om;
+      }
     }
 
     if(pts == AV_NOPTS_VALUE && dts != AV_NOPTS_VALUE) {
@@ -612,9 +777,10 @@ filter_aud_nal(uint8_t *dst, uint8_t *src, int len)
 static int
 filter_aud(uint8_t *d, int len)
 {
-  uint8_t *p;
+  uint8_t *p = NULL;
   uint8_t *dst = d;
   int outlen = 0;
+
 
   while(len > 3) {
     if(!(d[0] == 0 && d[1] == 0 && d[2] == 1)) {
@@ -746,27 +912,75 @@ decoder_decode(struct media_codec *mc, struct video_decoder *vd,
   pts = (pts / 1000) * 1000;
   dts = (dts / 1000) * 1000;
 
-  au.pts.low = pts;
-  au.pts.hi  = pts >> 32;
-  au.dts.low = dts;
-  au.dts.hi  = dts >> 32;
-
-  if(vdd->annexb.extradata != NULL && vdd->annexb.extradata_injected == 0) {
-    submit_au(vdd, &au, vdd->annexb.extradata,
-	      vdd->annexb.extradata_size, 0, vd);
-    vdd->annexb.extradata_injected = 1;
-  }
+  au.pts.low = (uint32_t)(pts >> 32);
+  au.pts.hi  = (uint32_t)pts;
+  au.dts.low = (uint32_t)(dts >> 32);
+  au.dts.hi  = (uint32_t)dts;
 
   uint8_t *data = mb->mb_data;
   size_t size = mb->mb_size;
 
-  h264_to_annexb(&vdd->annexb, &data, &size);
+  /**
+   * @brief Convert H.264 bitstream to Annex B format and prepend extradata.
+   *
+   * In H.264 video decoding architecture under Cell OS / RPCS3 HLE (libvdec),
+   * an Access Unit (AU) submitted via cellVdecDecodeAu must encompass at least one
+   * primary coded picture slice (VCL NAL unit). Previously, Movian submitted
+   * vdd->annexb.extradata (SPS/PPS) as an isolated, standalone AU before frame 0.
+   * Because an AU containing exclusively parameter sets lacks picture slice data,
+   * the underlying HLE video decoder (FFmpeg libavcodec inside RPCS3) flagged
+   * "[h264] no frame!" and returned AVERROR_INVALIDDATA (0xbebbb1b7). RPCS3 treated
+   * this as a fatal AU queuing error, permanently terminating the decoder thread
+   * and freezing video playback.
+   *
+   * To resolve this, extradata (SPS and PPS NAL units formatted with 00 00 00 01
+   * start codes) is directly prepended to the first video frame's converted Annex B
+   * payload inside a contiguous temporary buffer (vdd->au_buf). The combined payload
+   * [SPS][PPS][Slice Data] is then submitted as a single, fully valid Access Unit.
+   *
+   * Time Complexity: O(N) where N is the frame packet size for byte-order/start-code
+   * parsing and memory copying.
+   * Space Complexity: O(M) where M is the maximum frame size + extradata size allocated
+   * dynamically in vdd->au_buf.
+   */
+  if(data != NULL && size > 0 && mc->codec_id == AV_CODEC_ID_H264) {
+    h264_to_annexb(&vdd->annexb, &data, &size);
+
+    if(vdd->annexb.extradata != NULL && vdd->annexb.extradata_injected == 0) {
+      size_t total_size = vdd->annexb.extradata_size + size;
+      if(total_size > vdd->au_buf_size) {
+        uint8_t *new_buf = realloc(vdd->au_buf, total_size);
+        if(new_buf != NULL) {
+          vdd->au_buf = new_buf;
+          vdd->au_buf_size = total_size;
+        }
+      }
+      if(vdd->au_buf != NULL && total_size <= vdd->au_buf_size) {
+        memcpy(vdd->au_buf, vdd->annexb.extradata, vdd->annexb.extradata_size);
+        memcpy(vdd->au_buf + vdd->annexb.extradata_size, data, size);
+        data = vdd->au_buf;
+        size = total_size;
+        vdd->annexb.extradata_injected = 1;
+      }
+    }
+  }
+
   submit_au(vdd, &au, data, size, mb->mb_skip == 1, vd);
 }
 
 
 /**
+ * @brief Flush decoder pipeline on seek or stream reset.
  *
+ * Ends the active decoding sequence, restarts it with vdec_start_sequence,
+ * resets the extradata injection flag to ensure the subsequent keyframe
+ * correctly receives SPS/PPS parameter sets, and clears presentation timestamps.
+ *
+ * @param mc Pointer to media codec descriptor.
+ * @param vd Pointer to video decoder context.
+ *
+ * Time Complexity: O(1) synchronous sequence restart.
+ * Space Complexity: O(1) state reset.
  */
 static void
 decoder_flush(struct media_codec *mc, struct video_decoder *vd)
@@ -778,11 +992,22 @@ decoder_flush(struct media_codec *mc, struct video_decoder *vd)
   vd->vd_nextpts = AV_NOPTS_VALUE;
   vdd->flush_to = -1;
   vdd->do_flush = 1;
+  vdd->h264_zero_poc_count = 0;
 }
 
 
 /**
+ * @brief Teardown and release all PS3 hardware decoder resources.
  *
+ * Releases queued RSX pictures, closes the cellVdec instance, frees the
+ * reserved system memory block via Lv2Syscall1(349), destroys synchronization
+ * primitives, frees the auxiliary AU buffer and annexb conversion context,
+ * and deallocates the decoder instance.
+ *
+ * @param mc Pointer to media codec descriptor.
+ *
+ * Time Complexity: O(P) where P is the number of queued frames.
+ * Space Complexity: O(1) deallocation.
  */
 static void
 decoder_close(struct media_codec *mc)
@@ -801,6 +1026,7 @@ decoder_close(struct media_codec *mc)
 
   prop_ref_dec(vdd->metainfo);
   h264_to_annexb_cleanup(&vdd->annexb);
+  free(vdd->au_buf);
   free(vdd);
   TRACE(TRACE_DEBUG, "VDEC", "Cell decoder closed");
 }
@@ -836,8 +1062,10 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
   case AV_CODEC_ID_MPEG2VIDEO:
 
     hts_lwmutex_lock(&ps3_codec_sysmodule_mutex);
-    if(vdec_mpeg2_loaded == -1)
-      vdec_mpeg2_loaded = !SysLoadModule(SYSMODULE_VDEC_MPEG2);
+    if(vdec_mpeg2_loaded == -1) {
+      int ret = SysLoadModule(SYSMODULE_VDEC_MPEG2);
+      vdec_mpeg2_loaded = (ret == 0 || (uint32_t)ret == 0x80012001);
+    }
 
     if(!vdec_mpeg2_loaded) {
       hts_lwmutex_unlock(&ps3_codec_sysmodule_mutex);
@@ -916,8 +1144,10 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
     }
 
     hts_lwmutex_lock(&ps3_codec_sysmodule_mutex);
-    if(vdec_h264_loaded == -1)
-      vdec_h264_loaded = !SysLoadModule(SYSMODULE_VDEC_H264);
+    if(vdec_h264_loaded == -1) {
+      int ret = SysLoadModule(SYSMODULE_VDEC_H264);
+      vdec_h264_loaded = (ret == 0 || (uint32_t)ret == 0x80012001);
+    }
 
     if(!vdec_h264_loaded) {
       hts_lwmutex_unlock(&ps3_codec_sysmodule_mutex);
@@ -956,6 +1186,7 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
   if(Lv2Syscall3(348, allocsize, 0x400, (u64)&taddr)) {
     notify_add(mp->mp_prop_notifications, NOTIFY_WARNING, NULL, 10,
 	       _("Unable to open Cell codec. Unable to allocate %d bytes of RAM"), dec_attr.mem_size);
+    free(vdd);
     return 1;
   }
   vdd->mem = (void *)(uint64_t)taddr;
@@ -973,8 +1204,8 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
   vdd->config.ppu_thread_stack_size = 1 << 14;
 
   vdec_closure c;
-  c.fn = (intptr_t)OPD32(decoder_callback);
-  c.arg = (intptr_t)vdd;
+  c.fn = init_opd32(&vdd->cb_opd, (void *)decoder_callback);
+  c.arg = (uint32_t)(uintptr_t)vdd;
 
   r = vdec_open(&dec_type, &vdd->config, &c, &vdd->handle);
   if(r) {

@@ -755,7 +755,7 @@ static int win2k_read ( dvdcss_t dvdcss, void *p_buffer, int i_blocks )
 static int libc_readv ( dvdcss_t dvdcss, const struct iovec *p_iovec,
                         int i_blocks )
 {
-#if defined( _WIN32 )
+#if defined( _WIN32 ) || defined( PS3 ) || defined( __PS3__ )
     int i_index, i_len, i_total = 0;
     unsigned char *p_base;
     int i_bytes;

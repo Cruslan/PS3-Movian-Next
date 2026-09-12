@@ -15,38 +15,140 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-.SUFFIXES:
-SUFFIXES=
-
+.DEFAULT_GOAL := pkg
 
 C ?= ${CURDIR}
-
-include ${C}/config.default
+BUILD ?= ps3
 BUILDDIR ?= ${C}/build.${BUILD}
 
-# All targets deps on Makefile, but we can comment that out during dev:ing
-ALLDEPS=${BUILDDIR}/config.mak Makefile src/arch/${PLATFORM}/${PLATFORM}.mk
+ifeq ($(wildcard $(CURDIR)/ps3dev),)
+export PS3DEV	?= /usr/local/ps3dev
+else
+export PS3DEV	?= $(CURDIR)/ps3dev
+endif
+export PSL1GHT	?= $(PS3DEV)
+export PATH	:= $(PS3DEV)/bin:$(PS3DEV)/ppu/bin:$(PATH)
 
-ALLDEPS += ${STAMPS}
+TITLE		:= Movian Next
+APPID		:= HTSS00004
+CONTENTID	:= UP0001-$(APPID)_00-0000000000000000
+APPNAME		:= movian
+APPNAMEUSER	:= Movian Next
+APPVER		?= 1.0
+ICON0		:= $(CURDIR)/support/ps3icon.png
+SFOXML		:= $(CURDIR)/support/sfo.xml
 
-OPTFLAGS ?= -O${OPTLEVEL}
+SDK_RELEASE	:= nightly-2026-07-26
+HOST_OS		:= $(shell uname -s)
+HOST_ARCH	:= $(shell uname -m)
 
-VERSION ?= $(shell echo ${GIT_DESCRIBE_OUTPUT} | awk -F. '{ print $$1 "." $$2 "." $$3 }')
+ifeq ($(HOST_OS)-$(HOST_ARCH),Darwin-arm64)
+SDK_ASSET	:= ps3dev-macos-ARM64.tar.gz
+else ifeq ($(HOST_OS)-$(HOST_ARCH),Darwin-x86_64)
+SDK_ASSET	:= ps3dev-macos-X64.tar.gz
+else ifeq ($(HOST_OS)-$(HOST_ARCH),Linux-x86_64)
+SDK_ASSET	:= ps3dev-linux-X64.tar.gz
+else
+$(error Unsupported build host: $(HOST_OS)-$(HOST_ARCH))
+endif
+
+SDK_URL		:= https://github.com/ps3dev/ps3dev/releases/download/$(SDK_RELEASE)/$(SDK_ASSET)
+SDK_TAR		:= $(SDK_ASSET)
+
+# Toolchain definitions
+CC		:= $(PS3DEV)/ppu/bin/ppu-gcc
+CXX		:= $(PS3DEV)/ppu/bin/ppu-g++
+LINKER		:= $(CC)
+STRIP		:= $(PS3DEV)/ppu/bin/ppu-strip
+OBJDUMP		:= $(PS3DEV)/ppu/bin/ppu-objdump
+OBJCOPY		:= $(PS3DEV)/ppu/bin/ppu-objcopy
+RANLIB		:= $(PS3DEV)/ppu/bin/ppu-ranlib
+AR		:= $(PS3DEV)/ppu/bin/ppu-ar
+SPRXLINKER	:= $(PS3DEV)/bin/sprxlinker
+MAKE_SELF_NPDRM	:= $(PS3DEV)/bin/make_self_npdrm
+MAKE_SELF	:= $(PS3DEV)/bin/make_self
+SFO		:= $(PS3DEV)/bin/sfo
+PKG		:= $(PS3DEV)/bin/pkg
+PACKAGE_FINALIZE:= $(PS3DEV)/bin/package_finalize
+MKBUNDLE	:= $(CURDIR)/support/mkbundle
 
 PROG=${BUILDDIR}/movian
 LIB=${BUILDDIR}/libmovian
+OPTFLAGS ?= -mcpu=cell -O2
+ALLDEPS = Makefile $(BUILDDIR)/config.h $(BUILDDIR)/version_git.h
 
-include ${BUILDDIR}/config.mak
+$(BUILDDIR)/config.h: $(CURDIR)/src/config.h
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(BUILDDIR)/version_git.h: Makefile
+	@mkdir -p $(dir $@)
+	@echo "#define VERSION_GIT \"$(APPVER)\"" > $@
+
+
+# PS3 Component Flags
+CONFIG_AUDIOTEST		:= yes
+CONFIG_BITTORRENT		:= yes
+CONFIG_BOOKMARKS		:= yes
+CONFIG_DVD			:= yes
+CONFIG_EMU_THREAD_SPECIFICS	:= yes
+CONFIG_FTPCLIENT		:= yes
+CONFIG_FTPSERVER		:= yes
+CONFIG_GLW			:= yes
+CONFIG_GLW_BACKEND_RSX		:= yes
+CONFIG_GLW_FRONTEND_PS3		:= yes
+CONFIG_GLW_SETTINGS		:= yes
+CONFIG_GUMBO			:= yes
+CONFIG_HLS			:= yes
+CONFIG_HTSP			:= yes
+CONFIG_HTTPSERVER		:= yes
+CONFIG_ICECAST			:= yes
+CONFIG_KVSTORE			:= yes
+CONFIG_LIBAV			:= yes
+CONFIG_LIBFREETYPE		:= yes
+CONFIG_LIBNTFS			:= yes
+CONFIG_LIBRTMP			:= yes
+CONFIG_MEDIA_SETTINGS		:= yes
+CONFIG_METADATA			:= yes
+CONFIG_NATIVESMB		:= yes
+CONFIG_NETLOG			:= yes
+CONFIG_PLAYQUEUE		:= yes
+CONFIG_PLUGINS			:= yes
+CONFIG_POLARSSL			:= yes
+CONFIG_RAR			:= yes
+CONFIG_SQLITE			:= yes
+CONFIG_SQLITE_INTERNAL		:= yes
+CONFIG_SQLITE_LOCKING		:= yes
+CONFIG_SQLITE_VFS		:= yes
+CONFIG_STPP			:= yes
+CONFIG_TLSF			:= yes
+CONFIG_UPGRADE			:= no
+CONFIG_UPNP			:= yes
+CONFIG_USAGEREPORT		:= no
 
 CFLAGS_std += -Wall -Werror -Wwrite-strings -Wno-deprecated-declarations \
-		-Wmissing-prototypes -Wno-multichar  -Iext/dvd -std=gnu99
+		-Wmissing-prototypes -Wno-multichar -Iext/dvd -std=gnu99
+
+CFLAGS_cfg += -mminimal-toc -DWORDS_BIGENDIAN -fno-strict-aliasing \
+		-fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free \
+		-DPATH_MAX=512 -DPS3 -D_FILE_OFFSET_BITS=64 -include sys/time.h \
+		-I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I$(PS3DEV)/portlibs/ppu/include/freetype2 \
+		-Wno-format-truncation -Wno-format-overflow \
+		-I$(BUILDDIR)/inst/include -DUSE_POLARSSL -Iext/sqlite
+
+SQLITE_PLATFORM_DEFINES += -DSQLITE_OS_OTHER=1
+SQLITE_CFLAGS_cfg += -DSQLITE_OS_OTHER=1 -DSQLITE_DEFAULT_LOCKING_MODE=1 -DSQLITE_MUTEX_NOOP
+
+LDFLAGS_cfg += -Wl,--allow-multiple-definition -lvdec \
+		-L$(PS3DEV)/ppu/lib -L$(PS3DEV)/portlibs/ppu/lib \
+		-lrsx -lgcm_sys -laudio -lsysutil -lio -lnet -lnetctl -lsysmodule \
+		-lfreetype -lrt -lsysbase -llv2 -lm \
+		-L$(BUILDDIR)/inst/lib -lavresample -lswscale -lavformat -lavcodec -lavutil -lz -lm \
+		-lpthread -lrt -lsysbase -llv2 -lm
 
 CFLAGS = ${CFLAGS_std} ${OPTFLAGS}
+LDFLAGS += ${OPTFLAGS}
 
-#PGFLAGS ?= -pg
-
-OPTFLAGS += ${PGFLAGS}
-LDFLAGS += ${PGFLAGS} ${OPTFLAGS}
 
 
 ##############################################################
@@ -189,7 +291,7 @@ SRCS-$(CONFIG_SQLITE) += src/db/db_support.c
 
 
 
-${BUILDDIR}/ext/sqlite/sqlite3.o : CFLAGS = -O2 ${SQLITE_CFLAGS_cfg} \
+${BUILDDIR}/ext/sqlite/sqlite3.o : CFLAGS = ${OPTFLAGS} ${SQLITE_CFLAGS_cfg} \
  -DSQLITE_THREADSAFE=2 \
  -DSQLITE_OMIT_UTF16 \
  -DSQLITE_OMIT_AUTOINIT \
@@ -245,8 +347,6 @@ SRCS-$(CONFIG_LIBAV) += \
 	src/fileaccess/fa_video.c \
 	src/fileaccess/fa_audio.c \
 
-SRCS-$(CONFIG_LOCATEDB)        += src/fileaccess/fa_locatedb.c
-SRCS-$(CONFIG_SPOTLIGHT)       += src/fileaccess/fa_spotlight.c
 SRCS-$(CONFIG_LIBNTFS)         += src/fileaccess/fa_ntfs.c
 SRCS-$(CONFIG_NATIVESMB)       += src/fileaccess/smb/fa_nativesmb.c \
 				  src/fileaccess/smb/nmb.c
@@ -259,10 +359,6 @@ BUNDLES += res/fileaccess
 ##############################################################
 
 SRCS 			+= src/sd/sd.c
-SRCS-$(CONFIG_AVAHI) 	+= src/sd/avahi.c
-SRCS-$(CONFIG_BONJOUR) 	+= src/sd/bonjour.c
-
-${BUILDDIR}/src/sd/avahi.o : CFLAGS = $(CFLAGS_AVAHI) -Wall -Werror  ${OPTFLAGS}
 
 
 
@@ -292,7 +388,6 @@ SRCS += src/networking/net_common.c \
 SRCS-$(CONFIG_FTPSERVER) += src/networking/ftp_server.c
 
 SRCS-$(CONFIG_POLARSSL) += src/networking/net_polarssl.c
-SRCS-$(CONFIG_OPENSSL)  += src/networking/net_openssl.c
 
 SRCS-$(CONFIG_HTTPSERVER) += src/networking/http_server.c
 
@@ -303,10 +398,7 @@ SRCS-$(CONFIG_UPNP) +=  src/networking/ssdp.c \
 			src/upnp/upnp_browse.c \
 			src/upnp/upnp_avtransport.c \
 			src/upnp/upnp_renderingcontrol.c \
-			src/upnp/upnp_connectionmanager.c \
-
-SRCS-$(CONFIG_CONNMAN) += src/networking/connman.c
-SRCS-$(CONFIG_CONNMAN) += src/prop/prop_gvariant.c
+			src/upnp/upnp_connectionmanager.c
 
 ##############################################################
 # Video support
@@ -317,14 +409,6 @@ SRCS += src/video/video_playback.c \
 	src/video/h264_parser.c \
 	src/misc/bitstream.c \
 	src/video/h264_annexb.c \
-
-SRCS-$(CONFIG_VDPAU)    += src/video/vdpau.c
-
-SRCS-$(CONFIG_CEDAR) += \
-	src/ui/glw/glw_video_sunxi.c \
-	src/video/cedar.c \
-	ext/tlsf/tlsf.c \
-	src/arch/sunxi/sunxi.c \
 
 ##############################################################
 # Subtitles
@@ -340,7 +424,6 @@ SRCS += src/subtitles/subtitles.c \
 # Text rendering
 ##############################################################
 SRCS-$(CONFIG_LIBFREETYPE) += src/text/freetype.c
-SRCS-$(CONFIG_LIBFONTCONFIG) += src/text/fontconfig.c
 SRCS += src/text/parser.c
 SRCS += src/text/fontstash.c
 
@@ -451,72 +534,12 @@ SRCS-$(CONFIG_GLW)   += src/ui/glw/glw.c \
 
 SRCS-$(CONFIG_GLW_SETTINGS) += 	  src/ui/glw/glw_settings.c
 
-SRCS-$(CONFIG_GLW_FRONTEND_X11)	  += src/ui/glw/glw_x11.c \
-				     src/ui/linux/x11_common.c
-
-SRCS-$(CONFIG_GLW_BACKEND_OPENGL) += src/ui/glw/glw_opengl_shaders.c \
-                                     src/ui/glw/glw_opengl_ogl.c \
-                                     src/ui/glw/glw_texture_opengl.c \
-                                     src/ui/glw/glw_video_opengl.c \
-                                     src/ui/glw/glw_video_vdpau.c \
-
-SRCS-$(CONFIG_GLW_BACKEND_OPENGL_ES) += src/ui/glw/glw_opengl_shaders.c \
-                                        src/ui/glw/glw_opengl_es.c \
-                                        src/ui/glw/glw_texture_opengl.c \
-
-SRCS-$(CONFIG_GLW_REC)            += src/ui/glw/glw_rec.c
-
 SRCS-$(CONFIG_GLW_FRONTEND_PS3)   += src/ui/glw/glw_ps3.c
 SRCS-$(CONFIG_GLW_BACKEND_RSX)    += src/ui/glw/glw_rsx.c
 SRCS-$(CONFIG_GLW_BACKEND_RSX)    += src/ui/glw/glw_texture_rsx.c
 SRCS-$(CONFIG_GLW_BACKEND_RSX)    += src/ui/glw/glw_video_rsx.c
 
-SRCS-$(CONFIG_GLW_FRONTEND_WII)	  += src/ui/glw/glw_wii.c
-SRCS-$(CONFIG_GLW_BACKEND_GX)     += src/ui/glw/glw_texture_gx.c
-SRCS-$(CONFIG_GLW_BACKEND_GX)     += src/ui/glw/glw_gx.c
-SRCS-$(CONFIG_GLW_BACKEND_GX)     += src/ui/glw/glw_video_gx.c
-SRCS-$(CONFIG_GLW_BACKEND_GX)     += src/ui/glw/glw_gxasm.S
-
-SRCS-$(CONFIG_NVCTRL)             += src/ui/linux/nvidia.c
-
-BUNDLES-$(CONFIG_GLW_BACKEND_OPENGL)    += res/shaders/glsl
-BUNDLES-$(CONFIG_GLW_BACKEND_OPENGL_ES) += res/shaders/glsl
-
-${BUILDDIR}/src/ui/glw/%.o : CFLAGS = ${OPTFLAGS} ${CFLAGS_std} -ffast-math
-
-##############################################################
-# GTK based interface
-##############################################################
-SRCS-$(CONFIG_GU) +=    src/ui/gu/gu.c \
-			src/ui/gu/gu_helpers.c \
-			src/ui/gu/gu_pixbuf.c \
-			src/ui/gu/gu_popup.c \
-			src/ui/gu/gu_menu.c \
-			src/ui/gu/gu_menubar.c \
-			src/ui/gu/gu_toolbar.c \
-			src/ui/gu/gu_statusbar.c \
-			src/ui/gu/gu_playdeck.c \
-			src/ui/gu/gu_pages.c \
-			src/ui/gu/gu_home.c \
-			src/ui/gu/gu_settings.c \
-			src/ui/gu/gu_directory.c \
-			src/ui/gu/gu_directory_store.c \
-			src/ui/gu/gu_directory_list.c \
-			src/ui/gu/gu_directory_album.c \
-			src/ui/gu/gu_directory_albumcollection.c \
-			src/ui/gu/gu_cell_bar.c \
-			src/ui/gu/gu_video.c \
-			src/ui/linux/x11_common.c \
-
-${BUILDDIR}/src/ui/gu/%.o : CFLAGS = $(CFLAGS_GTK) ${OPTFLAGS} ${CFLAGS_std}
-
-
-##############################################################
-# IPC
-##############################################################
-SRCS-$(CONFIG_LIRC) +=  src/ipc/lirc.c
-SRCS-$(CONFIG_LIBCEC) +=  src/ipc/libcec.c
-SRCS-$(CONFIG_STDIN)+=  src/ipc/stdin.c
+${BUILDDIR}/src/ui/glw/%.o : CFLAGS = ${OPTFLAGS} ${CFLAGS_std} -fno-strict-aliasing
 
 ##############################################################
 # RTMP
@@ -779,21 +802,40 @@ SRCS-$(CONFIG_GUMBO) += \
 	ext/gumbo-parser/src/vector.c \
 	src/ecmascript/es_gumbo.c \
 
-${BUILDDIR}/ext/gumbo-parser/%.o : CFLAGS = -Wall ${OPTFLAGS} -fstrict-aliasing -std=c99 -Wno-unused-variable
+${BUILDDIR}/ext/gumbo-parser/%.o : CFLAGS = -Wall ${OPTFLAGS} -fno-strict-aliasing -std=c99 -Wno-unused-variable
 
 ##############################################################
 # Dataroot
 ##############################################################
 
-${BUILDDIR}/support/dataroot/%.o : CFLAGS = -O2
+${BUILDDIR}/support/dataroot/bundle.o : CFLAGS = ${OPTFLAGS}
 
 ##############################################################
 ##############################################################
 ##############################################################
 
-include support/gitver.mk
+# PS3 Core Sources
+SRCS += src/arch/ps3/ps3_main.c \
+	src/arch/ps3/ps3_threads.c \
+	src/arch/ps3/ps3_trap.c \
+	src/arch/ps3/ps3_vdec.c \
+	src/arch/ps3/ps3_audio.c \
+	src/arch/ps3/ps3_tlsf.c \
+	src/networking/net_psl1ght.c \
+	src/networking/asyncio_posix.c \
+	src/fileaccess/fa_funopen.c \
+	src/fileaccess/fa_fs.c \
+	src/htsmsg/persistent_file.c
 
-include src/arch/${PLATFORM}/${PLATFORM}.mk
+# PS3 Bundles
+BUNDLES += res/shaders/rsx \
+	glwskins/flat \
+	res/fonts \
+	res/svg \
+	lang \
+	res/static \
+	res/ecmascript \
+	res/speaker_positions
 
 
 # Various transformations
@@ -830,31 +872,124 @@ $(foreach VAR,$(BRIEF), \
     $(eval $(VAR) = @$$(call ECHO,$(VAR),$$(MSG)); $($(VAR))))
 endif
 
-.PHONY:	clean distclean makever build-%
+EBOOT       := $(BUILDDIR)/pkg/USRDIR/EBOOT.BIN
+ELF         := $(BUILDDIR)/$(APPNAME).elf
+BUNDLE_ELF  := $(BUILDDIR)/$(APPNAME).bundle
+SELF        := $(BUILDDIR)/$(APPNAME).self
+SYMS        := $(BUILDDIR)/$(APPNAME).syms
+PKG_FILE    := $(BUILDDIR)/$(APPNAME).pkg
+GEOHOT_PKG  := $(BUILDDIR)/$(APPNAME)_geohot.pkg
 
-${PROG}: $(OBJS) $(ALLDEPS)  ${BUILDDIR}/support/dataroot/wd.o
-	$(LINKER) -o $@ $(OBJS) ${BUILDDIR}/support/dataroot/wd.o $(LDFLAGS) ${LDFLAGS_cfg}
+all: pkg
 
-${PROG}.bundle: $(OBJS) $(BUNDLE_OBJS) $(ALLDEPS) ${BUILDDIR}/support/dataroot/bundle.o
-	$(LINKER) -o $@ $(OBJS) ${BUILDDIR}/support/dataroot/bundle.o $(BUNDLE_OBJS) $(LDFLAGS) ${LDFLAGS_cfg}
+$(BUNDLE_ELF): $(OBJS) $(BUNDLE_OBJS) $(ALLDEPS) $(BUILDDIR)/support/dataroot/bundle.o
+	@mkdir -p $(dir $@)
+	$(LINKER) -o $@ $(OBJS) $(BUILDDIR)/support/dataroot/bundle.o $(BUNDLE_OBJS) $(LDFLAGS) $(LDFLAGS_cfg)
 
-${PROG}.datadir: $(OBJS) $(ALLDEPS) ${BUILDDIR}/support/dataroot/datadir.o
-	$(LINKER) -o $@ $(OBJS) ${BUILDDIR}/support/dataroot/datadir.o $(LDFLAGS) ${LDFLAGS_cfg}
+$(ELF): $(BUNDLE_ELF) Makefile
+	@mkdir -p $(dir $@)
+	$(STRIP) -o $@ $<
+	$(SPRXLINKER) $@
 
-${LIB}.so: $(OBJS) $(BUNDLE_OBJS) $(ALLDEPS)  support/dataroot/bundle.c
-	$(LINKER) -shared -o $@ $(OBJS) support/dataroot/bundle.c $(BUNDLE_OBJS) ${LDFLAGS_cfg}
+$(SYMS): $(BUNDLE_ELF) Makefile
+	@mkdir -p $(dir $@)
+	$(OBJDUMP) -t -j .text $< | awk '{print $$1 " " $$NF}' | sort > $@
 
-.PHONY: ${BUILDDIR}/zipbundles/bundle.zip
+$(SELF): $(ELF) Makefile
+	@mkdir -p $(dir $@)
+	$(MAKE_SELF) $< $@
 
-${BUILDDIR}/zipbundles/bundle.zip:
-	rm -rf  ${BUILDDIR}/zipbundles
-	mkdir -p ${BUILDDIR}/zipbundles
-	zip -0r ${BUILDDIR}/zipbundles/bundle.zip ${BUNDLES}
+$(EBOOT): $(ELF) Makefile
+	@mkdir -p $(dir $@)
+	$(MAKE_SELF_NPDRM) $< $@ $(CONTENTID)
 
-$(BUILDDIR)/support/dataroot/ziptail.o: src/main.h
+$(BUILDDIR)/PARAM.SFO: $(SFOXML)
+	@mkdir -p $(dir $@)
+	$(SFO) --title "$(APPNAMEUSER)" --appid "$(APPID)" -f $< $@
 
-${PROG}.ziptail: $(OBJS) $(ALLDEPS) $(BUILDDIR)/support/dataroot/ziptail.o
-	$(CC) -o $@ $(OBJS) $(BUILDDIR)/support/dataroot/ziptail.o $(LDFLAGS) ${LDFLAGS_cfg}
+$(PKG_FILE): $(EBOOT) $(BUILDDIR)/PARAM.SFO
+	@mkdir -p $(BUILDDIR)/pkg
+	cp $(ICON0) $(BUILDDIR)/pkg/ICON0.PNG
+	cp $(BUILDDIR)/PARAM.SFO $(BUILDDIR)/pkg/PARAM.SFO
+	$(PKG) --contentid=$(CONTENTID) $(BUILDDIR)/pkg/ $@
+
+$(GEOHOT_PKG): $(PKG_FILE) Makefile
+	cp $< $@
+	$(PACKAGE_FINALIZE) $@
+
+pkg: $(PKG_FILE) $(GEOHOT_PKG)
+self: $(SELF)
+eboot: $(EBOOT)
+
+install: $(PKG_FILE)
+	cp $< $(PS3INSTALL)/$(APPNAME).pkg
+	sync
+
+CLEAN_TARGETS = $(BUILDDIR)/src \
+		$(BUILDDIR)/bundles \
+		$(BUILDDIR)/pkg \
+		$(BUILDDIR)/support \
+		$(BUILDDIR)/stamps \
+		$(BUILDDIR)/$(APPNAME) \
+		$(BUILDDIR)/$(APPNAME).* \
+		$(BUILDDIR)/EBOOT.BIN \
+		$(BUILDDIR)/PARAM.SFO \
+		$(BUILDDIR)/ICON0.PNG \
+		$(BUILDDIR)/config.h \
+		$(BUILDDIR)/version_git.h \
+		$(BUILDDIR)/*.o \
+		$(BUILDDIR)/*.d \
+		$(PKG_FILE) \
+		$(GEOHOT_PKG)
+
+clean:
+	@echo "Cleaning Movian application build artifacts..."
+	@for target in $(CLEAN_TARGETS); do \
+		for f in $$target; do \
+			if [ -e "$$f" ]; then \
+				gio trash "$$f" 2>/dev/null || kioclient --noninteractive move "$$f" trash:/ 2>/dev/null || true; \
+			fi; \
+		done; \
+	done
+	@echo "Clean completed successfully."
+
+clean-ext:
+	@echo "Cleaning external compiled libraries (ext/)..."
+	@if [ -d "$(BUILDDIR)/ext" ]; then \
+		gio trash "$(BUILDDIR)/ext" 2>/dev/null || kioclient --noninteractive move "$(BUILDDIR)/ext" trash:/ 2>/dev/null || true; \
+	fi
+	@echo "External libraries cleaned successfully."
+
+clean-all: clean clean-ext
+	@echo "All build artifacts and libraries cleaned."
+
+distclean:
+	@echo "Cleaning all build directories..."
+	@for d in build.*; do \
+		if [ -e "$$d" ]; then \
+			gio trash "$$d" 2>/dev/null || kioclient --noninteractive move "$$d" trash:/ 2>/dev/null || true; \
+		fi; \
+	done
+	@echo "Distclean completed successfully."
+
+prepare:
+	@echo "Downloading PS3 SDK from $(SDK_URL)..."
+	curl --fail --location --output $(SDK_TAR).tmp $(SDK_URL)
+	mv $(SDK_TAR).tmp $(SDK_TAR)
+	@echo "Extracting PS3 SDK to project directory..."
+	tar -xzf $(SDK_TAR) -C .
+	@echo "Cleaning up archive..."
+	gio trash $(SDK_TAR) 2>/dev/null || true
+	@echo "PS3 SDK environment successfully set up in ./ps3dev."
+	@echo "Project is ready to build. Run 'make -j12' to compile."
+
+.PHONY: all pkg self eboot install clean clean-ext clean-all distclean prepare makever build-%
+
+
+src/version.c: ${BUILDDIR}/version_git.h
+
+# Include dependency files if they exist.
+-include $(DEPS) $(BUNDLE_DEPS)
 
 
 ${BUILDDIR}/%.o: %.c $(ALLDEPS)
@@ -865,36 +1000,9 @@ ${BUILDDIR}/%.o: %.S $(ALLDEPS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS_com) $(CFLAGS) $(CFLAGS_cfg) -c -o $@ $(C)/$<
 
-${BUILDDIR}/%.o: %.m $(ALLDEPS)
-	@mkdir -p $(dir $@)
-	$(CC) -MD -MP $(CFLAGS_com) $(CFLAGS) $(CFLAGS_cfg) -c -o $@ $(C)/$<
-
-${BUILDDIR}/%.o: %.cpp $(ALLDEPS)
-	@mkdir -p $(dir $@)
-	$(CXX) -MD -MP $(CFLAGS_com) $(CFLAGS_cfg) -c -o $@ $(C)/$<
-
-clean:
-	rm -rf ${BUILDDIR}/src ${BUILDDIR}/ext ${BUILDDIR}/bundles
-	find . -name "*~" | xargs rm -f
-
-distclean:
-	rm -rf build.*
-	find . -name "*~" | xargs rm -f
-
-reconfigure:
-	$(C)/configure.${CONFIGURE_POSTFIX} $(CONFIGURE_ARGS)
-
-showconfig:
-	@echo $(CONFIGURE_ARGS)
-
-src/version.c: ${BUILDDIR}/version_git.h
-
-# Include dependency files if they exist.
--include $(DEPS) $(BUNDLE_DEPS)
-
-
 # Bundle files
 $(BUILDDIR)/bundles/%.o: $(BUILDDIR)/bundles/%.c $(ALLDEPS)
+
 	$(CC) $(CFLAGS_cfg) -I${C}/src/fileaccess -c -o $@ $<
 
 $(BUILDDIR)/bundles/%.c: % $(C)/support/mkbundle $(ALLDEPS)

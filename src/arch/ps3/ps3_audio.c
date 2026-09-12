@@ -26,9 +26,12 @@
 #include <errno.h>
 #include <altivec.h>
 
+/**
+ * PSL1GHT v2 Audio and Event Queue Subsystems:
+ * Standardizes on 48 kHz float interleaved PCM with hardware notify event queue pacing.
+ */
 #include <audio/audio.h>
-#include <psl1ght/lv2/timer.h>
-#include <sysutil/audio.h>
+#include <sys/event_queue.h>
 
 #include <libavutil/avutil.h>
 
@@ -36,18 +39,17 @@
 #include "media/media.h"
 #include "audio2/audio.h"
 
-static int max_pcm;
-static int max_dts;
-static int max_ac3;
-
 /**
+ * @brief PS3 Audio Decoder Context.
  *
+ * Encapsulates the active audio port state, ring-buffer configuration, and synchronization
+ * event queue between the PPU audio feeder thread and GameOS audio mixer hardware.
  */
 typedef struct decoder {
   audio_decoder_t ad;
   u32 port_num;
   sys_event_queue_t snd_queue;
-  AudioPortConfig config;
+  audioPortConfig config;
   u64 snd_queue_key;
   int channels;
   int write_ptr;
@@ -78,9 +80,11 @@ ps3_audio_destroy_port(decoder_t *d)
     audioPortStop(d->port_num);
     audioRemoveNotifyEventQueue(d->snd_queue_key);
     audioPortClose(d->port_num);
-    sys_event_queue_destroy(d->snd_queue, 0);
+    /* Destroy the audio event queue utilizing modern PSL1GHT v2 sysEventQueueDestroy */
+    sysEventQueueDestroy(d->snd_queue, 0);
     d->port_num = INVALID_PORT;
   }
+
 }
 
 
@@ -112,110 +116,81 @@ ps3_audio_fini(audio_decoder_t *ad)
 /**
  *
  */
+/**
+ * @brief Reconfigures the active PS3 audio output port according to input channel layout.
+ *
+ * Tears down any previously open port and allocates a fresh PSL1GHT v2 audio port
+ * configured for 48000 Hz 32-bit floating point PCM with 2 or 8 channels.
+ *
+ * @param ad Pointer to base audio decoder instance.
+ * @return int Returns 0 on success, or non-zero error code.
+ *
+ * @complexity Time: O(1) device open/configure latency. Space: O(1).
+ */
 static int
 ps3_audio_reconfig(audio_decoder_t *ad)
 {
   decoder_t *d = (decoder_t *)ad;
 
+  /* Destroy existing active port before reallocating */
   ps3_audio_destroy_port(d);
 
+  /* The Cell audio service fixed hardware rate and format: 48 kHz Float32 */
   ad->ad_out_sample_rate = 48000;
   ad->ad_out_sample_format = AV_SAMPLE_FMT_FLT;
- 
-  AudioOutConfiguration conf;
-  memset(&conf, 0, sizeof(conf));
 
+  /* Determine channel layout: 2 channels for stereo/mono, 8 channels for surround */
   if(ad->ad_in_channel_layout == AV_CH_LAYOUT_MONO ||
      ad->ad_in_channel_layout == AV_CH_LAYOUT_STEREO) {
     ad->ad_out_channel_layout = AV_CH_LAYOUT_STEREO;
     d->channels = 2;
-    conf.channel = 2;
-    conf.encoder = AUDIO_OUT_CODING_TYPE_LPCM;
-  } else if(ad->ad_in_channel_layout &
-	    (AV_CH_BACK_LEFT |
-	     AV_CH_BACK_RIGHT |
-	     AV_CH_BACK_CENTER)) {
-
-    d->channels = 8;
-    ad->ad_out_channel_layout = AV_CH_LAYOUT_7POINT1;
-    if(max_pcm == 8) {
-      conf.channel = 8;
-      conf.encoder = AUDIO_OUT_CODING_TYPE_LPCM;
-    } else if(max_ac3 == 6) {
-      conf.channel = 6;
-      conf.encoder = AUDIO_OUT_CODING_TYPE_AC3;
-      conf.down_mixer = AUDIO_OUT_DOWNMIXER_TYPE_B;
-    } else if(max_dts == 6) {
-      conf.channel = 6;
-      conf.encoder = AUDIO_OUT_CODING_TYPE_DTS;
-      conf.down_mixer = AUDIO_OUT_DOWNMIXER_TYPE_B;
-    } else {
-      d->channels = 2;
-      conf.channel = 2;
-      conf.encoder = AUDIO_OUT_CODING_TYPE_LPCM;
-      conf.down_mixer = AUDIO_OUT_DOWNMIXER_TYPE_A;
-      ad->ad_out_channel_layout = AV_CH_LAYOUT_STEREO;
-    } 
   } else {
-
-
     d->channels = 8;
     ad->ad_out_channel_layout = AV_CH_LAYOUT_7POINT1;
-    if(max_pcm >= 6) {
-      conf.channel = 6;
-      conf.encoder = AUDIO_OUT_CODING_TYPE_LPCM;
-    } else if(max_ac3 == 6) {
-      conf.channel = 6;
-      conf.encoder = AUDIO_OUT_CODING_TYPE_AC3;
-    } else if(max_dts == 6) {
-      conf.channel = 6;
-      conf.encoder = AUDIO_OUT_CODING_TYPE_DTS;
-    } else {
-      conf.channel = 2;
-      conf.encoder = AUDIO_OUT_CODING_TYPE_LPCM;
-      conf.down_mixer = AUDIO_OUT_DOWNMIXER_TYPE_A;
-      ad->ad_out_channel_layout = AV_CH_LAYOUT_STEREO;
-      d->channels = 2;
-    }    
-  }
-	     
-  int r;
-  r = audioOutConfigure(AUDIO_OUT_PRIMARY, &conf, NULL, 1);
-  if(r == 0) {
-    int i;
-    for(i = 0; i < 100;i++) {
-      AudioOutState state;
-      r = audioOutGetState(AUDIO_OUT_PRIMARY, 0, &state);
-      if(r != 0)
-	break;
-      TRACE(TRACE_DEBUG, "AUDIO", "The state is %d", state.state);
-      if(state.state == 2)
-	continue;
-      usleep(100);
-      break;
-    }
   }
 
-  AudioPortParam params;
-
+  /* Configure PSL1GHT v2 audio port parameters */
+  audioPortParam params;
+  memset(&params, 0, sizeof(params));
   params.numChannels = d->channels;
   params.numBlocks = d->audio_blocks;
-  params.attr = 0;
-  params.level = 1;
-	
-  audioPortOpen(&params, &d->port_num);
+  params.attrib = 0;
+  params.level = 1.0f;
 
-  TRACE(TRACE_DEBUG, "AUDIO", 
-	"PS3 audio port %d opened (%d channels)",
-	d->port_num, d->channels);
-	
+  /*
+   * Open hardware audio port via PSL1GHT v2 libaudio.
+   * If requesting an 8-channel surround port fails (e.g. on stereo-only HDMI/AV
+   * hardware configurations or stereo emulator backends), gracefully fall back
+   * to 2-channel stereo. The upstream libavresample instance will automatically
+   * perform multi-channel downmixing (5.1/7.1 to stereo) using AltiVec vector SIMD.
+   */
+  int r = audioPortOpen(&params, &d->port_num);
+  if(r != 0 && d->channels == 8) {
+    TRACE(TRACE_INFO, "AUDIO",
+          "Failed to open 8-channel PS3 audio port (0x%x), attempting fallback to stereo (2ch)", r);
+    d->channels = 2;
+    ad->ad_out_channel_layout = AV_CH_LAYOUT_STEREO;
+    params.numChannels = 2;
+    r = audioPortOpen(&params, &d->port_num);
+  }
 
+  if(r != 0) {
+    TRACE(TRACE_ERROR, "AUDIO", "Failed to open PS3 audio port: 0x%x", r);
+    d->port_num = INVALID_PORT;
+    return -1;
+  }
+
+  TRACE(TRACE_DEBUG, "AUDIO",
+        "PS3 audio port %d opened (%d channels, %d blocks)",
+        d->port_num, d->channels, d->audio_blocks);
+
+  /* Query mapped ring-buffer layout and register notify event queue */
   audioGetPortConfig(d->port_num, &d->config);
   audioCreateNotifyEventQueue(&d->snd_queue, &d->snd_queue_key);
   audioSetNotifyEventQueue(d->snd_queue_key);
-  sys_event_queue_drain(d->snd_queue);
+  sysEventQueueDrain(d->snd_queue);
   audioPortStart(d->port_num);
-	
+
   return 0;
 }
 
@@ -232,7 +207,7 @@ ps3_audio_deliver(audio_decoder_t *ad, int samples, int64_t pts, int epoch)
   assert(samples >= AUDIO_BLOCK_SAMPLES);
 
   sys_event_t event;
-  int ret = sys_event_queue_receive(d->snd_queue, &event, 20 * 1000);
+  int ret = sysEventQueueReceive(d->snd_queue, &event, 20 * 1000);
   if(ret)
     TRACE(TRACE_ERROR, "PS3AUDIO", "Audio queue timeout");
 
@@ -333,30 +308,20 @@ static audio_class_t ps3_audio_class = {
 
 
 /**
+ * @brief Global PlayStation 3 audio driver subsystem initialization.
  *
+ * Initializes the PSL1GHT v2 audio service and returns the driver class descriptor.
+ *
+ * @param asettings Audio driver properties structure.
+ * @return audio_class_t* Pointer to the PS3 audio decoder class.
+ *
+ * @complexity Time: O(1). Space: O(1).
  */
 audio_class_t *
 audio_driver_init(struct prop *asettings)
 {
-
-  max_pcm = audioOutGetSoundAvailability(AUDIO_OUT_PRIMARY,
-					 AUDIO_OUT_CODING_TYPE_LPCM,
-					 AUDIO_OUT_FS_48KHZ,
-					 0);
-  
-  max_dts = audioOutGetSoundAvailability(AUDIO_OUT_PRIMARY,
-					 AUDIO_OUT_CODING_TYPE_DTS,
-					 AUDIO_OUT_FS_48KHZ,
-					 0);
-
-  max_ac3 = audioOutGetSoundAvailability(AUDIO_OUT_PRIMARY,
-					 AUDIO_OUT_CODING_TYPE_AC3,
-					 AUDIO_OUT_FS_48KHZ,
-					 0);
-
+  /* Initialize PSL1GHT audio subsystem */
   audioInit();
-
-  audioOutSetCopyControl(AUDIO_OUT_PRIMARY, AUDIO_OUT_COPY_CONTROL_FREE);
 
   return &ps3_audio_class;
 }

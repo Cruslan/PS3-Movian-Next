@@ -41,8 +41,9 @@
 #include "usage.h"
 #include "settings.h"
 
-static int stpp_controller = 1;
-static int stpp_controllee = 1;
+static int stpp_controller = 0;
+static int stpp_controllee = 0;
+static int stpp_webcontrol = 0;
 
 
 RB_HEAD(stpp_subscription_tree, stpp_subscription);
@@ -1688,10 +1689,12 @@ stpp_netif_update(const struct netif *ni)
       }
       LIST_INSERT_HEAD(&stpp_interfaces, si, si_link);
 
-      stpp_send(si->si_af, NULL);
-
-      asyncio_timer_init(&si->si_periodic_timer, stpp_periodic, si);
-      asyncio_timer_arm_delta_sec(&si->si_periodic_timer, 1);
+      /* Only broadcast announcement and arm periodic timers if remote control is enabled */
+      if(stpp_controllee) {
+        stpp_send(si->si_af, NULL);
+        asyncio_timer_init(&si->si_periodic_timer, stpp_periodic, si);
+        asyncio_timer_arm_delta_sec(&si->si_periodic_timer, 1);
+      }
 
       TRACE(TRACE_DEBUG, "STPP", "STPP started on '%s'", si->si_ifname);
     } else {
@@ -1714,12 +1717,75 @@ stpp_netif_update(const struct netif *ni)
   }
 }
 
+/**
+ * @brief Synchronize the HTTP server socket state with remote control preferences.
+ *
+ * @details Checks if either companion app remote control (STPP) or direct browser-based
+ *          web control is enabled. If either is active, ensures the HTTP server is listening.
+ *          If both are disabled, tears down the listening socket to ensure zero open ports.
+ *
+ * @return void
+ * @complexity O(1) socket configuration update.
+ */
+static void
+stpp_update_server(void)
+{
+  http_server_set_enabled(stpp_controllee || stpp_webcontrol);
+}
 
+/**
+ * @brief Callback triggered when user toggles 'Allow remote control' setting.
+ *
+ * @details When activated (on=1), arms periodic STPP announcement timers across all
+ *          active network interfaces and brings up the underlying HTTP server.
+ *          When deactivated (on=0), disarms announcement timers, transmits an explicit
+ *          goodbye packet to flush peer caches, and shuts down the HTTP server if
+ *          web remote control is also disabled.
+ *
+ * @param opaque Context pointer (unused).
+ * @param on Integer boolean; 1 if enabled, 0 if disabled.
+ * @return void
+ * @complexity O(I) where I is the number of active network interfaces.
+ */
 static void
 stpp_set_controllee(void *opaque, int on)
 {
   stpp_controllee = on;
-  stpp_broadcast(1);
+  stpp_update_server();
+
+  if(on) {
+    /* Arm announcement timers on all active network interfaces */
+    stpp_interface_t *si;
+    LIST_FOREACH(si, &stpp_interfaces, si_link) {
+      stpp_send(si->si_af, NULL);
+      asyncio_timer_init(&si->si_periodic_timer, stpp_periodic, si);
+      asyncio_timer_arm_delta_sec(&si->si_periodic_timer, 1);
+    }
+  } else {
+    /* Disarm announcement timers and broadcast departure */
+    stpp_interface_t *si;
+    LIST_FOREACH(si, &stpp_interfaces, si_link) {
+      asyncio_timer_disarm(&si->si_periodic_timer);
+    }
+    stpp_broadcast(1);
+  }
+}
+
+/**
+ * @brief Callback triggered when user toggles 'Allow web remote control' setting.
+ *
+ * @details Allows direct web browser access to Movian on port 42000.
+ *
+ * @param opaque Context pointer (unused).
+ * @param on Integer boolean; 1 if enabled, 0 if disabled.
+ * @return void
+ * @complexity O(1)
+ */
+static void
+stpp_set_webcontrol(void *opaque, int on)
+{
+  stpp_webcontrol = on;
+  stpp_update_server();
 }
 
 
@@ -1745,12 +1811,22 @@ stpp_discover_init(void)
 
   settings_create_separator(gconf.settings_network, _p("Remote control"));
 
+  /* Companion app remote control - disabled by default (SETTING_VALUE 0) */
   setting_create(SETTING_BOOL, gconf.settings_network, SETTINGS_INITIAL_UPDATE,
                  SETTING_TITLE(_p("Allow remote control")),
-                 SETTING_VALUE(1),
+                 SETTING_VALUE(0),
                  SETTING_CALLBACK(stpp_set_controllee, NULL),
                  SETTING_COURIER(asyncio_courier),
                  SETTING_STORE("stpp", "enablecontrollee"),
+                 NULL);
+
+  /* Web browser remote control interface - disabled by default (SETTING_VALUE 0) */
+  setting_create(SETTING_BOOL, gconf.settings_network, SETTINGS_INITIAL_UPDATE,
+                 SETTING_TITLE(_p("Allow web remote control")),
+                 SETTING_VALUE(0),
+                 SETTING_CALLBACK(stpp_set_webcontrol, NULL),
+                 SETTING_COURIER(asyncio_courier),
+                 SETTING_STORE("stpp", "enablewebcontrol"),
                  NULL);
 
 

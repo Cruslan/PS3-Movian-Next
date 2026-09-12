@@ -1,7 +1,7 @@
 <?xml version="1.0" ?>
 <sfo>
 	<value name="APP_VER" type="string">
-		05.00
+		01.00
 	</value>
 	<value name="ATTRIBUTE" type="integer">
 		5
@@ -28,10 +28,10 @@
 		791
 	</value>
 	<value name="TITLE" type="string">
-		Movian
+		Movian Next
 	</value>
 	<value name="TITLE_ID" type="string">
-		TEST00000
+		HTSS00004
 	</value>
 	<value name="VERSION" type="string">
 		01.00

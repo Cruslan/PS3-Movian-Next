@@ -105,7 +105,8 @@ metadata_add_source(const char *name, const char *description,
   void *db = metadb_get();
   int rc;
   int id = METADATA_PERMANENT_ERROR;
-  int enabled = 1;
+  /* Metadata sources default to disabled to prevent unsolicited internet scrapers */
+  int enabled = 0;
   sqlite3_stmt *stmt;
 
  again:

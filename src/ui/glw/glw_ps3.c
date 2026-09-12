@@ -30,6 +30,7 @@
 #include "settings.h"
 
 #include "glw.h"
+#include "glw_rsx.h"
 #include "glw_settings.h"
 #include "glw_video_common.h"
 
@@ -40,21 +41,52 @@
 #include "navigator.h"
 #include "arch/arch.h"
 
-#include <psl1ght/lv2.h>
+/**
+ * PPU LV2 Kernel Services & RSX Graphics Subsystem Headers (PSL1GHT v2):
+ * Supplies low-level LV2 syscalls, RSX command fifo primitives, hardware registers,
+ * and memory management for the PlayStation 3 Cell Broadband Engine & RSX NV47 GPU.
+ */
+#include <ppu-lv2.h>
+#include <rsx/gcm_sys.h>
+#include <rsx/rsx.h>
 #include <rsx/commands.h>
 #include <rsx/nv40.h>
-#include <rsx/reality.h>
 
-#include <psl1ght/lv2/memory.h>
+#include <lv2/memory.h>
+#include <sys/memory.h>
 
 #include <sysutil/video.h>
-#include <sysutil/events.h>
+#include <sysutil/sysutil.h>
+#include <sysutil/osk.h>
 
 #include <io/pad.h>
 #include <io/kb.h>
-#include <io/osk.h>
 
 #include <sysmodule/sysmodule.h>
+
+/**
+ * Type aliases and compatibility bindings:
+ * Bridges historical PSL1GHT v1 structure types and LV2 uppercase syscall macros
+ * to modern PSL1GHT v2 canonical standards.
+ */
+typedef padData PadData;
+typedef padInfo2 PadInfo2;
+typedef videoResolution VideoResolution;
+typedef videoState VideoState;
+typedef videoConfiguration VideoConfiguration;
+typedef sys_mem_container_t mem_container_t;
+
+#ifndef Lv2Syscall0
+#define Lv2Syscall0 lv2syscall0
+#define Lv2Syscall1 lv2syscall1
+#define Lv2Syscall2 lv2syscall2
+#define Lv2Syscall3 lv2syscall3
+#define Lv2Syscall4 lv2syscall4
+#define Lv2Syscall5 lv2syscall5
+#define Lv2Syscall6 lv2syscall6
+#define Lv2Syscall7 lv2syscall7
+#define Lv2Syscall8 lv2syscall8
+#endif
 
 
 #include "glw_rec.h"
@@ -94,10 +126,91 @@ static struct extent_pool *rsx_mempool;
 static hts_mutex_t rsx_mempool_lock;
 static void clear_btns(void);
 
+static u32 *rsx_initial_cmd_buffer = NULL;
+static u32 rsx_cmd_buffer_words = 0;
+static int first_fb = 1;
 
+#define GCM_LABEL_INDEX 255
+static u32 sLabelVal = 1;
 
 extern s32 ioPadGetDataExtra(u32 port, u32* type, PadData* data);
 
+/**
+ * @brief Wait for all queued RSX backend commands to complete execution.
+ *
+ * Emits a backend label write command into the RSX command ring buffer, flushes
+ * the FIFO via rsxFlushBuffer, and actively polls the hardware label address until
+ * the RSX rasterization backend acknowledges completion of all prior rendering tasks.
+ *
+ * @param context Pointer to active GCM context descriptor.
+ *
+ * Algorithmic & Synchronization Invariants:
+ * - Emits hardware label token at GCM_LABEL_INDEX (255) holding sLabelVal.
+ * - Yields host CPU via usleep(30) during active polling to avoid thread contention.
+ *
+ * Complexity:
+ * - Time Complexity: O(T) where T is RSX hardware pipeline drain duration.
+ * - Space Complexity: O(1) stack allocation.
+ */
+static void
+waitFinish(gcmContextData *context)
+{
+  /* Emit backend label write command into the active RSX command buffer */
+  rsxSetWriteBackendLabel(context, GCM_LABEL_INDEX, sLabelVal);
+
+  /* Flush the FIFO to guarantee the RSX hardware immediately fetches and processes commands */
+  rsxFlushBuffer(context);
+
+  /* Poll the volatile memory-mapped label register until the RSX signals completion */
+  while(*(vu32*)gcmGetLabelAddress(GCM_LABEL_INDEX) != sLabelVal)
+    usleep(30);
+
+  /* Increment monotonic label sequence value for subsequent synchronizations */
+  ++sLabelVal;
+}
+
+/**
+ * @brief Synchronize the RSX command processor to complete idle state.
+ *
+ * Flushes all pending hardware commands in the FIFO and ensures GET and PUT pointers
+ * are completely aligned and drained. This establishes architectural synchronization
+ * before registering framebuffers and initializing rendering context, avoiding FIFO desync.
+ *
+ * @param context Pointer to active GCM context descriptor.
+ *
+ * Algorithmic Invariants:
+ * - Emits paired write-backend and wait-backend label commands to enforce pipeline fence.
+ * - Calls waitFinish to block PPU execution until the RSX processor arrives at full idle.
+ *
+ * Complexity:
+ * - Time Complexity: O(T) where T is RSX hardware pipeline drain duration.
+ * - Space Complexity: O(1) stack allocation.
+ */
+static void
+waitRSXIdle(gcmContextData *context)
+{
+  /* Enqueue backend label write and synchronization wait barriers in command FIFO */
+  rsxSetWriteBackendLabel(context, GCM_LABEL_INDEX, sLabelVal);
+  rsxSetWaitLabel(context, GCM_LABEL_INDEX, sLabelVal);
+
+  /* Increment label counter before dispatching finish barrier */
+  ++sLabelVal;
+
+  /* Flush and block until RSX has completely drained all commands and entered idle state */
+  waitFinish(context);
+}
+
+/**
+ * @brief Waits for hardware VSYNC display scanout swap to complete.
+ *
+ * Polls the RSX display flip status register until the pending buffer flip has
+ * transitioned to the scanout rasterizer. Sleeps in 200 microsecond increments
+ * to yield CPU time to concurrent worker and media decoding threads.
+ *
+ * Algorithmic Complexity:
+ * - Time Complexity: O(1) bounded by VSYNC duration (max 16.6 ms at 60 Hz).
+ * - Space Complexity: O(1) stack allocation.
+ */
 static void
 waitFlip()
 {
@@ -114,12 +227,104 @@ waitFlip()
   gcmResetFlipStatus();
 }
 
+/**
+ * @brief Reset the RSX command buffer to the initial post-setup address every frame.
+ *
+ * Implements the canonical command buffer ring-buffer reset documented by RPCS3 lead RSX
+ * developer kd-11 in ps3gl (source/rsxutil.c):
+ * 1. Emits rsxFinish(ctx, 1) command marker into the active stream.
+ * 2. Emits an NV40 hardware JUMP opcode pointing directly to rsx_initial_cmd_buffer offset.
+ * 3. Enforces a PowerPC architecture memory barrier (__asm__ volatile("sync" ::: "memory"))
+ *    guaranteeing that the JUMP opcode is committed to physical RAM before modifying control registers.
+ * 4. Updates the hardware PUT control register (ctrl->put = startoffs). Because the RSX GET pointer
+ *    is currently at the tail of the buffer (GET != PUT), the RSX FIFO fetches and executes through
+ *    the JUMP instruction, branching GET to startoffs. At startoffs, GET == PUT, causing the RSX
+ *    command processor to cleanly halt in an idle state without fetching stale data.
+ * 5. PPU spins on ctrl->get with usleep yielding until the RSX processor arrives at startoffs.
+ * 6. Resets GCM context cursors (current, begin, end) back to rsx_initial_cmd_buffer.
+ *
+ * @param gp Pointer to PS3 UI state context.
+ *
+ * Complexity:
+ * - Time Complexity: O(1) bounded hardware register polling.
+ * - Space Complexity: O(1) stack allocation.
+ */
+static void
+resetCommandBuffer(glw_ps3_t *gp)
+{
+  gcmContextData *ctx = gp->gr.gr_be.be_ctx;
+  u32 startoffs = 0;
+
+  rsxFinish(ctx, 1);
+
+  if(unlikely(rsxAddressToOffset(rsx_initial_cmd_buffer, &startoffs) != 0))
+    return;
+
+  rsxSetJumpCommand(ctx, startoffs);
+  __asm__ volatile("sync" ::: "memory");
+
+  gcmControlRegister volatile *ctrl = gcmGetControlRegister();
+  ctrl->put = startoffs;
+
+  uint32_t spins = 0;
+  while(ctrl->get != startoffs && spins < 100000) {
+    usleep(30);
+    spins++;
+  }
+
+  ctx->current = rsx_initial_cmd_buffer;
+  ctx->begin   = rsx_initial_cmd_buffer;
+  ctx->end     = rsx_initial_cmd_buffer + rsx_cmd_buffer_words;
+}
+
+/**
+ * @brief Queue hardware display buffer flip, enforce VSYNC synchronization,
+ * and execute seamless command buffer ring-buffer reset at each frame boundary.
+ *
+ * Implements canonical frame-boundary display synchronization and command buffer resetting:
+ * 1. Drains pending RSX commands for the current frame via waitFinish(ctx).
+ * 2. Synchronizes with hardware VSYNC scanout swap via waitFlip().
+ * 3. Enqueues display flip for the current backbuffer via gcmSetFlip(ctx, buffer) and flushes FIFO.
+ * 4. Writes gcmSetWaitFlip(ctx) so RSX rasterizer waits for upcoming display scanout before rendering.
+ * 5. Calls resetCommandBuffer(gp) to return the 4MB buffer back to rsx_initial_cmd_buffer every single frame.
+ *
+ * @param gp Pointer to PS3 UI state context.
+ * @param buffer Double-buffering index (0 or 1) to be flipped to the display scanout.
+ *
+ * Time Complexity: O(1) command emission and bounded register synchronization.
+ * Space Complexity: O(1) stack allocation.
+ */
 static void
 flip(glw_ps3_t *gp, s32 buffer) 
 {
-  gcmSetFlip(gp->gr.gr_be.be_ctx, buffer);
-  realityFlushBuffer(gp->gr.gr_be.be_ctx);
-  gcmSetWaitFlip(gp->gr.gr_be.be_ctx);
+  gcmContextData *ctx = gp->gr.gr_be.be_ctx;
+
+  /* 1. Flush active rendering commands and ensure RSX finishes execution for this frame */
+  waitFinish(ctx);
+
+  /* 2. Synchronize with display VSYNC scanout */
+  if(!first_fb)
+    waitFlip();
+  else {
+    gcmResetFlipStatus();
+    first_fb = 0;
+  }
+
+  /* Log initial frames and periodic milestones for runtime verification */
+  static int flip_count = 0;
+  if(flip_count++ < 5 || (flip_count % 300) == 0) {
+    TRACE(TRACE_DEBUG, "GLW", "flip #%d on buffer %d", flip_count, buffer);
+  }
+
+  /* 3. Dispatch hardware flip for the backbuffer we just finished rendering */
+  gcmSetFlip(ctx, buffer);
+  rsxFlushBuffer(ctx);
+
+  /* 4. Enqueue VSYNC wait-flip marker for the next frame */
+  gcmSetWaitFlip(ctx);
+
+  /* 5. Reset command buffer back to rsx_initial_cmd_buffer every single frame */
+  resetCommandBuffer(gp);
 }
 
 
@@ -186,31 +391,106 @@ rsx_read_pixels(glw_root_t *gr)
 
 
 /**
+ * @brief Defensive hardware GCM Context callback executed on command buffer boundary exhaustion.
+ *
+ * Invoked by librsx when immediate-mode drawing commands exceed context->end.
+ * In PSL1GHT v2 rsx_function_macros.h:
+ *   #define RSX_CONTEXT_CURRENT_BEGIN(count) do { \
+ *     if((context->current + (count)) > context->end) { \
+ *       if(rsxContextCallback(context,(count))!=0) return; \
+ *     } \
+ *   } while(0)
+ *
+ * If this callback returns 0, execution does NOT abort and writing continues directly past
+ * context->end, causing memory corruption of adjacent font glyph and texture pools.
+ * Returning -1 forces rsxContextCallback to return -1, causing the calling routine
+ * (e.g. rsxDrawVertex4f or glw_rsx_set_vp_constant_4f) to immediately abort and return,
+ * establishing a hard hardware barrier against memory corruption.
+ *
+ * @param context Pointer to active GCM context descriptor.
+ * @param count Number of 32-bit command words requested by the caller.
+ * @return s32 -1 to abort command emission and prevent writing past context->end.
+ *
+ * Complexity:
+ * - Time Complexity: O(1) error logging.
+ * - Space Complexity: O(1) stack allocation.
+ */
+static s32
+movian_rsx_cb(gcmContextData *context, u32 count)
+{
+  TRACE(TRACE_ERROR, "RSX", "Command buffer overflow intercepted and prevented (count=%u current=%p end=%p)\n",
+        (unsigned int)count, context->current, context->end);
+  return -1;
+}
+
+/**
  *
  */
 static void
 init_screen(glw_ps3_t *gp)
 {
 
-  // Allocate a 1Mb buffer, alligned to a 1Mb boundary to be our shared IO memory with the RSX.
+  /**
+   * Allocate an 8MB shared host I/O memory window aligned to a 1MB boundary.
+   * Granularity 0x400 represents 1MB pages in LV2 sys_memory_allocate (syscall 348).
+   * Providing an 8MB memory window with a 4MB hardware command buffer provides hundreds
+   * of frames of continuous rendering between ring-buffer wraps while conserving over 56MB
+   * of GameOS physical RAM required for the Cell hardware video decoder (cellVdec).
+   */
   u32 taddr;
-  Lv2Syscall3(348, 1024*1024, 0x400, (u64)&taddr);
+  Lv2Syscall3(348, 8 * 1024 * 1024, 0x400, (u64)&taddr);
   void *host_addr = (void *)(uint64_t)taddr;
   assert(host_addr != NULL);
 
-  // Initilise Reality, which sets up the command buffer and shared IO memory
-  gp->gr.gr_be.be_ctx = realityInit(0x10000, 1024*1024, host_addr); 
+  /**
+   * Initialize RSX Command Buffer & Hardware Context (librsx):
+   * Allocates a 4MB command buffer (0x400000) inside the 8MB shared host I/O memory
+   * window accessible by both PPE and RSX DMA engine.
+   */
+  s32 r_rsx = rsxInit(&gp->gr.gr_be.be_ctx, 4 * 1024 * 1024, 8 * 1024 * 1024, host_addr); 
+  assert(r_rsx == 0);
   assert(gp->gr.gr_be.be_ctx != NULL);
+  
+  /* Synchronize RSX hardware FIFO so all initial configuration commands from rsxInit are flushed and processed */
+  waitRSXIdle(gp->gr.gr_be.be_ctx);
+
+  /* Register robust hardware ring-buffer wrap callback */
+  rsxSetUserCallback(movian_rsx_cb);
+  gp->gr.gr_be.be_ctx->callback = movian_rsx_cb;
+
+  /**
+   * Save initial post-initialization command buffer pointer.
+   * rsxInit executes initial hardware register configuration between offset 0x1000 and 0x13a0.
+   * Subsequent rendering frames must reset back to this initial cursor rather than 0x1000,
+   * avoiding accidental corruption of hardware device objects or flip queues.
+   */
+  rsx_initial_cmd_buffer = gp->gr.gr_be.be_ctx->current;
+  u32 initial_offset = 0;
+  rsxAddressToOffset(rsx_initial_cmd_buffer, &initial_offset);
+
+  u32 total_cb_bytes = 4 * 1024 * 1024;
+  u32 used_init_bytes = (initial_offset >= 4096) ? (initial_offset - 4096) : 0;
+  u32 available_bytes = (total_cb_bytes > used_init_bytes + 4096) ? (total_cb_bytes - used_init_bytes - 4096) : (total_cb_bytes / 2);
+  rsx_cmd_buffer_words = available_bytes / sizeof(u32);
+
+  gp->gr.gr_be.be_ctx->begin = rsx_initial_cmd_buffer;
+  gp->gr.gr_be.be_ctx->current = rsx_initial_cmd_buffer;
+  gp->gr.gr_be.be_ctx->end = rsx_initial_cmd_buffer + rsx_cmd_buffer_words;
+
+  TRACE(TRACE_DEBUG, "RSX", "Command buffer bounds: begin=%p current=%p end=%p span=%ld bytes (init_offset=0x%x)\n",
+        gp->gr.gr_be.be_ctx->begin, gp->gr.gr_be.be_ctx->current, gp->gr.gr_be.be_ctx->end,
+        (long)((char*)gp->gr.gr_be.be_ctx->end - (char*)gp->gr.gr_be.be_ctx->begin), (unsigned int)initial_offset);
   
   gcmConfiguration config;
   gcmGetConfiguration(&config);
 
-  TRACE(TRACE_DEBUG, "RSX", "memory @ 0x%x size = %d\n",
-	config.localAddress, config.localSize);
+  TRACE(TRACE_DEBUG, "RSX", "memory @ %p size = %u\n",
+	config.localAddress, (unsigned int)config.localSize);
 
   hts_mutex_init(&rsx_mempool_lock);
   rsx_mempool = extent_create(0, config.localSize >> 4);
-  rsx_address = (void *)(uint64_t)config.localAddress;
+  rsx_address = config.localAddress;
+
 
 
   VideoState state;
@@ -239,7 +519,7 @@ init_screen(glw_ps3_t *gp)
 
 
   gp->framebuffer_pitch = 4 * gp->res.width; // each pixel is 4 bytes
-  gp->depthbuffer_pitch = 4 * gp->res.width; // And each value in the depth buffer is a 16 bit float
+  gp->depthbuffer_pitch = 4 * gp->res.width; // 4 bytes per pixel for Z24S8 (24-bit depth + 8-bit stencil)
   
   // Configure the buffer format to xRGB
   VideoConfiguration vconfig;
@@ -247,6 +527,7 @@ init_screen(glw_ps3_t *gp)
   vconfig.resolution = state.displayMode.resolution;
   vconfig.format = VIDEO_BUFFER_FORMAT_XRGB;
   vconfig.pitch = gp->framebuffer_pitch;
+  vconfig.aspect = state.displayMode.aspect;
 
   videoConfigure(0, &vconfig, NULL, 0);
   videoGetState(0, 0, &state);
@@ -258,13 +539,15 @@ init_screen(glw_ps3_t *gp)
   gcmSetFlipMode(GCM_FLIP_VSYNC); // Wait for VSYNC to flip
   
   // Allocate two buffers for the RSX to draw to the screen (double buffering)
-  gp->framebuffer[0] = rsx_alloc(buffer_size, 16);
-  gp->framebuffer[1] = rsx_alloc(buffer_size, 16);
+  // Mandate strict 64-byte alignment required by NV40/G70 scanout & render surfaces
+  gp->framebuffer[0] = rsx_alloc(buffer_size, 64);
+  gp->framebuffer[1] = rsx_alloc(buffer_size, 64);
 
   TRACE(TRACE_DEBUG, "RSX", "Buffers at 0x%x 0x%x\n",
 	gp->framebuffer[0], gp->framebuffer[1]);
 
-  gp->depthbuffer = rsx_alloc(depth_buffer_size * 4, 16);
+  /* Allocate depth buffer with 4 bytes per pixel for Z24S8 */
+  gp->depthbuffer = rsx_alloc(depth_buffer_size, 64);
   
   // Setup the display buffers
   gcmSetDisplayBuffer(0, gp->framebuffer[0],
@@ -273,18 +556,19 @@ init_screen(glw_ps3_t *gp)
 		      gp->framebuffer_pitch, gp->res.width, gp->res.height);
 
   gp->gr.gr_br_read_pixels = rsx_read_pixels;
-
-  gcmResetFlipStatus();
-  flip(gp, 1);
 }
 
 
 
 
-extern int sysUtilGetSystemParamInt(int, int *);
-
 /**
+ * @brief Initialize PS3 GLW display, pad controllers, and system preferences.
  *
+ * @param gp Pointer to PS3 UI state context.
+ * @return 0 on success.
+ *
+ * Time Complexity: O(1) system hardware initialization.
+ * Space Complexity: O(1) memory overhead.
  */
 static int
 glw_ps3_init(glw_ps3_t *gp)
@@ -299,7 +583,8 @@ glw_ps3_init(glw_ps3_t *gp)
   for(i = 0; i < 7; i++)
     ioPadSetPortSetting(i, 0x2);
 
-  if(sysUtilGetSystemParamInt(0x112, &gp->button_assign))
+  /* Query PS3 system parameter for cross vs circle button assignment convention */
+  if(sysUtilGetSystemParamInt(SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN, &gp->button_assign))
     gp->button_assign = 1;
 
   return 0;
@@ -316,13 +601,13 @@ osk_returned(glw_ps3_t *gp)
   uint8_t ret[512];
   uint8_t buf[512];
   
-  if(param.result != 0)
+  if(param.res != 0)
     return;
 
   assert(gp->osk_widget != NULL);
 
-  param.length = sizeof(ret)/2;
-  param.str_addr = (intptr_t)ret;
+  param.len = sizeof(ret)/2;
+  param.str = (u16 *)ret;
   oskUnloadAsync(&param);
 
   ucs2_to_utf8(buf, sizeof(buf), ret, sizeof(ret), 0);
@@ -356,7 +641,7 @@ osk_destroyed(glw_ps3_t *gp)
   gp->osk_widget = NULL;
 
   if(gp->osk_container != 0xFFFFFFFFU)
-    lv2MemContinerDestroy(gp->osk_container);
+    sysMemContainerDestroy(gp->osk_container);
 }
 
 /**
@@ -396,11 +681,12 @@ osk_open(glw_root_t *gr, const char *title, const char *input, glw_t *w,
   param.allowedPanels = param.firstViewPanel;
   param.prohibitFlags = OSK_PROHIBIT_RETURN;
 
-  ifi.message_addr = (intptr_t)title16;
-  ifi.startText_addr = (intptr_t)input16;
+  ifi.message = (u16 *)title16;
+  ifi.startText = (u16 *)input16;
   ifi.maxLength = 256;
 
-  if(lv2MemContinerCreate(&gp->osk_container, 2 * 1024 * 1024))
+  /* Allocate a dedicated 2MB memory container for the OSK utility */
+  if(sysMemContainerCreate(&gp->osk_container, 2 * 1024 * 1024))
     gp->osk_container = 0xFFFFFFFFU;
 
   oskSetKeyLayoutOption(3);
@@ -418,7 +704,14 @@ osk_open(glw_root_t *gr, const char *title, const char *input, glw_t *w,
 
 
 /**
+ * @brief Dispatch system utility and XMB event notifications.
  *
+ * @param status Event identifier representing OSK, XMB, or application termination state.
+ * @param param Event-specific auxiliary payload data.
+ * @param userdata Pointer to user state context (glw_ps3_t).
+ *
+ * Time Complexity: O(1) state branch evaluation.
+ * Space Complexity: O(1).
  */
 static void 
 eventHandle(u64 status, u64 param, void *userdata) 
@@ -428,33 +721,33 @@ eventHandle(u64 status, u64 param, void *userdata)
   case 0x11:
     TRACE(TRACE_INFO, "XMB", "Got close request from XMB");
     break;
-  case EVENT_REQUEST_EXITAPP:
+  case SYSUTIL_EXIT_GAME:
     gp->gp_stop = 1;
     break;
-  case EVENT_MENU_OPEN:
+  case SYSUTIL_MENU_OPEN:
     TRACE(TRACE_INFO, "XMB", "Opened");
     media_global_hold(1, MP_HOLD_OS);
     break;
-  case EVENT_MENU_CLOSE:
+  case SYSUTIL_MENU_CLOSE:
     TRACE(TRACE_INFO, "XMB", "Closed");
     media_global_hold(0, MP_HOLD_OS);
     break;
-  case EVENT_DRAWING_BEGIN:
+  case SYSUTIL_DRAW_BEGIN:
     break;
-  case EVENT_DRAWING_END:
+  case SYSUTIL_DRAW_END:
     break;
-  case EVENT_OSK_LOADED: 
+  case SYSUTIL_OSK_LOADED: 
     TRACE(TRACE_DEBUG, "OSK", "Loaded");
     break;
-  case EVENT_OSK_FINISHED: 
+  case SYSUTIL_OSK_DONE: 
     TRACE(TRACE_DEBUG, "OSK", "Finished");
     osk_returned(gp);
     break;
-  case EVENT_OSK_UNLOADED:
+  case SYSUTIL_OSK_UNLOADED:
     TRACE(TRACE_DEBUG, "OSK", "Unloaded");
     osk_destroyed(gp);
     break;
-  case EVENT_OSK_INPUT_CANCELED:
+  case SYSUTIL_OSK_INPUT_CANCELED:
     TRACE(TRACE_DEBUG, "OSK", "Input canceled");
     oskAbort();
     break;
@@ -466,28 +759,77 @@ eventHandle(u64 status, u64 param, void *userdata)
 }
 
 
+/**
+ * @brief Bind hardware color buffer and depth-stencil surface for rendering.
+ *
+ * @param gp Pointer to PS3 UI state context.
+ * @param currentBuffer Framebuffer index (0 or 1) targeted for rasterization.
+ *
+ * Invariant Rationale:
+ * RSX hardware rasterizer expects a populated gcmSurface descriptor with linear
+ * pitch, 32-bit X8R8G8B8 color target, and 16-bit ZETA depth configuration.
+ *
+ * Time Complexity: O(1) fixed-size hardware command generation.
+ * Space Complexity: O(1) stack allocation for gcmSurface.
+ */
 static void
 setupRenderTarget(glw_ps3_t *gp, u32 currentBuffer) 
 {
-  realitySetRenderSurface(gp->gr.gr_be.be_ctx,
-			  REALITY_SURFACE_COLOR0, REALITY_RSX_MEMORY, 
-			  gp->framebuffer[currentBuffer],
-			  gp->framebuffer_pitch);
-  
-  realitySetRenderSurface(gp->gr.gr_be.be_ctx,
-			  REALITY_SURFACE_ZETA, REALITY_RSX_MEMORY, 
-			  gp->depthbuffer, gp->depthbuffer_pitch);
+  gcmSurface sf;
+  memset(&sf, 0, sizeof(gcmSurface));
 
-  realitySelectRenderTarget(gp->gr.gr_be.be_ctx, REALITY_TARGET_0, 
-			    REALITY_TARGET_FORMAT_COLOR_X8R8G8B8 | 
-			    REALITY_TARGET_FORMAT_ZETA_Z16 | 
-			    REALITY_TARGET_FORMAT_TYPE_LINEAR,
-			    gp->res.width, gp->res.height, 0, 0);
+  /* Configure surface target geometry and color formats */
+  sf.type = GCM_SURFACE_TYPE_LINEAR;
+  sf.antiAlias = GCM_SURFACE_CENTER_1;
+  sf.colorFormat = GCM_SURFACE_X8R8G8B8;
+  sf.colorTarget = GCM_SURFACE_TARGET_0;
 
-  realityDepthTestEnable(gp->gr.gr_be.be_ctx, 0);
-  realityDepthWriteEnable(gp->gr.gr_be.be_ctx, 0);
+  /* Color target 0: RSX local GDDR3 VRAM offset and line stride */
+  sf.colorLocation[0] = GCM_LOCATION_RSX;
+  sf.colorOffset[0] = gp->framebuffer[currentBuffer];
+  sf.colorPitch[0] = gp->framebuffer_pitch;
+
+  /* Multiple Render Targets (MRT 1-3): Set unused dummy slots to RSX memory */
+  sf.colorLocation[1] = GCM_LOCATION_RSX;
+  sf.colorLocation[2] = GCM_LOCATION_RSX;
+  sf.colorLocation[3] = GCM_LOCATION_RSX;
+  sf.colorPitch[1] = 64;
+  sf.colorPitch[2] = 64;
+  sf.colorPitch[3] = 64;
+
+  /* Depth buffer: 24-bit depth / 8-bit stencil format (Z24S8 matching 4 bytes/pixel depthbuffer_pitch) */
+  sf.depthFormat = GCM_SURFACE_ZETA_Z24S8;
+  sf.depthLocation = GCM_LOCATION_RSX;
+  sf.depthOffset = gp->depthbuffer;
+  sf.depthPitch = gp->depthbuffer_pitch;
+
+  /* Dimensions and viewport origin */
+  sf.width = gp->res.width;
+  sf.height = gp->res.height;
+  sf.x = 0;
+  sf.y = 0;
+
+  /* Enqueue render target swap and disable hardware depth test for 2D UI */
+  rsxSetSurface(gp->gr.gr_be.be_ctx, &sf);
+  rsxSetDepthTestEnable(gp->gr.gr_be.be_ctx, 0);
+  rsxSetDepthWriteEnable(gp->gr.gr_be.be_ctx, 0);
 }
 
+/**
+ * @brief Render single frame into offscreen backbuffer with viewport setup & clearing.
+ *
+ * @param gp Pointer to PS3 UI state context.
+ * @param buffer Target display backbuffer index.
+ * @param with_universe Boolean flag indicating whether widget tree layout & draw executes.
+ *
+ * Mathematical Viewport Transform:
+ * Viewport scale is derived such that NDC coordinates [-1, 1] map to pixel space [0, W] and [0, H]:
+ *   scale = (width * 0.5, -height * 0.5, 1.0, 0.0) [inverted Y for screen-space downward coords]
+ *   offset = (width * 0.5, height * 0.5, 0.0, 0.0)
+ *
+ * Time Complexity: O(N) where N is the number of active layout widgets in the universe.
+ * Space Complexity: O(1) rendering state overhead.
+ */
 static void 
 drawFrame(glw_ps3_t *gp, int buffer, int with_universe)
 {
@@ -495,48 +837,46 @@ drawFrame(glw_ps3_t *gp, int buffer, int with_universe)
 
   gcmContextData *ctx = gp->gr.gr_be.be_ctx;
 
-  realityViewportTranslate(ctx,
-			   gp->res.width/2, gp->res.height/2, 0.0, 0.0);
-  realityViewportScale(ctx,
-		       gp->res.width/2, -gp->res.height/2, 1.0, 0.0); 
-
-  realityZControl(ctx, 0, 1, 1); // disable viewport culling
-
-  // Enable alpha blending.
-  realityBlendFunc(ctx,
-		   NV30_3D_BLEND_FUNC_SRC_RGB_SRC_ALPHA |
-		   NV30_3D_BLEND_FUNC_SRC_ALPHA_SRC_ALPHA,
-		   NV30_3D_BLEND_FUNC_DST_RGB_ONE_MINUS_SRC_ALPHA |
-		   NV30_3D_BLEND_FUNC_DST_ALPHA_ZERO);
-  realityBlendEquation(ctx, NV40_3D_BLEND_EQUATION_RGB_FUNC_ADD |
-		       NV40_3D_BLEND_EQUATION_ALPHA_FUNC_ADD);
-  realityBlendEnable(ctx, 1);
-
-  realityViewport(ctx, gp->res.width, gp->res.height);
-  
+  /* First bind the render target surface to establish surface dimensions and pixel formats */
   setupRenderTarget(gp, buffer);
 
-  // set the clear color
-  realitySetClearColor(ctx, 0x00000000);
+  /* Diagnostic trace verifying continuous active rasterization */
+  static int frame_count = 0;
+  if(frame_count++ < 5 || (frame_count % 300) == 0) {
+    TRACE(TRACE_DEBUG, "GLW", "drawFrame #%d on buffer %d (with_universe=%d)",
+          frame_count, buffer, with_universe);
+  }
 
-  realitySetClearDepthValue(ctx, 0xffff);
+  /* Setup viewport scale and translation vectors */
+  f32 scale[4] = { gp->res.width * 0.5f, -gp->res.height * 0.5f, 1.0f, 0.0f };
+  f32 offset[4] = { gp->res.width * 0.5f, gp->res.height * 0.5f, 0.0f, 0.0f };
+  rsxSetViewport(ctx, 0, 0, gp->res.width, gp->res.height, 0.0f, 1.0f, scale, offset);
+  rsxSetViewportClip(ctx, 0, gp->res.width, gp->res.height);
 
-  // Clear the buffers
-  realityClearBuffers(ctx,
-		      REALITY_CLEAR_BUFFERS_COLOR_R |
-		      REALITY_CLEAR_BUFFERS_COLOR_G |
-		      REALITY_CLEAR_BUFFERS_COLOR_B |
-		      NV30_3D_CLEAR_BUFFERS_COLOR_A | 
-		      REALITY_CLEAR_BUFFERS_DEPTH);
+  /* Disable near/far clipping plane rejection and enable Z clamping.
+   * Movian's 2D perspective matrix positions layout elements at negative Z depths.
+   * Without disabling near/far culling (cullNearFar=0, zClampEnable=1, cullIgnoreW=1),
+   * the RSX hardware rasterizer discards all primitives before fragment generation. */
+  rsxSetZMinMaxControl(ctx, 0, 1, 1);
 
+  /* Configure hardware alpha blending equation: (SrcRGB * SrcAlpha) + (DstRGB * (1 - SrcAlpha)) */
+  rsxSetBlendFunc(ctx, GCM_SRC_ALPHA, GCM_ONE_MINUS_SRC_ALPHA, GCM_SRC_ALPHA, GCM_ZERO);
+  rsxSetBlendEquation(ctx, GCM_FUNC_ADD, GCM_FUNC_ADD);
+  rsxSetBlendEnable(ctx, 1);
 
-  // XMB may overwrite currently loaded shaders, so clear them out
+  /* Set clear color to solid black and clear depth-stencil buffer (24-bit depth 0xffffff, 8-bit stencil 0x00) */
+  rsxSetClearColor(ctx, 0x00000000);
+  rsxSetClearDepthStencil(ctx, 0xffffff00);
+
+  /* Issue clear command for RGBA, Z depth, and stencil buffers */
+  rsxClearSurface(ctx, GCM_CLEAR_R | GCM_CLEAR_G | GCM_CLEAR_B | GCM_CLEAR_A | GCM_CLEAR_Z | GCM_CLEAR_S);
+
+  /* Reset cached shader pointers in case XMB overlay altered GPU registers */
   gp->gr.gr_be.be_vp_current = NULL;
   gp->gr.gr_be.be_fp_current = NULL;
 
-  realityCullEnable(ctx, 1);
-  realityFrontFace(ctx, REALITY_FRONT_FACE_CCW);
-  realityCullFace(ctx, REALITY_CULL_FACE_BACK);
+  /* Disable backface culling for 2D UI elements to prevent quad winding drops */
+  rsxSetCullFaceEnable(ctx, 0);
 
   if(!with_universe)
     return;
@@ -763,69 +1103,7 @@ handle_btn(glw_ps3_t *gp, int pad, int code, int pressed, int sel, int pre)
 }
 
 
-typedef enum _io_pad_bd_code
-{
-       BTN_BD_KEY_1           = 0x00,
-       BTN_BD_KEY_2           = 0x01,
-       BTN_BD_KEY_3           = 0x02,
-       BTN_BD_KEY_4           = 0x03,
-       BTN_BD_KEY_5           = 0x04,
-       BTN_BD_KEY_6           = 0x05,
-       BTN_BD_KEY_7           = 0x06,
-       BTN_BD_KEY_8           = 0x07,
-       BTN_BD_KEY_9           = 0x08,
-       BTN_BD_KEY_0           = 0x09,
-       BTN_BD_ENTER           = 0x0b,
-       BTN_BD_RETURN          = 0x0e,
-       BTN_BD_CLEAR           = 0x0f,
-       BTN_BD_EJECT           = 0x16,
-       BTN_BD_TOPMENU         = 0x1a,
-       BTN_BD_TIME            = 0x28,
-       BTN_BD_PREV            = 0x30,
-       BTN_BD_NEXT            = 0x31,
-       BTN_BD_PLAY            = 0x32,
-       BTN_BD_SCAN_REV        = 0x33,
-       BTN_BD_SCAN_FWD        = 0x34,
-       BTN_BD_STOP            = 0x38,
-       BTN_BD_PAUSE           = 0x39,
-       BTN_BD_POPUP_MENU      = 0x40,
-       BTN_BD_SELECT          = 0x50,
-       BTN_BD_L3              = 0x51,
-       BTN_BD_R3              = 0x52,
-       BTN_BD_START           = 0x53,
-       BTN_BD_UP              = 0x54,
-       BTN_BD_RIGHT           = 0x55,
-       BTN_BD_DOWN            = 0x56,
-       BTN_BD_LEFT            = 0x57,
-       BTN_BD_L2              = 0x58,
-       BTN_BD_R2              = 0x59,
-       BTN_BD_L1              = 0x5a,
-       BTN_BD_R1              = 0x5b,
-       BTN_BD_TRIANGLE        = 0x5c,
-       BTN_BD_CIRCLE          = 0x5d,
-       BTN_BD_CROSS           = 0x5e,
-       BTN_BD_SQUARE          = 0x5f,
-       BTN_BD_SLOW_REV        = 0x60,
-       BTN_BD_SLOW_FWD        = 0x61,
-       BTN_BD_SUBTITLE        = 0x63,
-       BTN_BD_AUDIO           = 0x64,
-       BTN_BD_ANGLE           = 0x65,
-       BTN_BD_DISPLAY         = 0x70,
-       BTN_BD_BLUE            = 0x80,
-       BTN_BD_RED             = 0x81,
-       BTN_BD_GREEN           = 0x82,
-       BTN_BD_YELLOW          = 0x83,
-       BTN_BD_RELEASE         = 0xff,
 
-       /* TV controller */
-       BTN_BD_NUMBER_11       = 0x101e,
-       BTN_BD_NUMBER_12       = 0x101f,
-       BTN_BD_NUMBER_PERIOD   = 0x102a,
-       BTN_BD_PROGRAM_UP      = 0x1030,
-       BTN_BD_PROGRAM_DOWN    = 0x1031,
-       BTN_BD_PREV_CHANNEL    = 0x1032,
-       BTN_BD_PROGRAM_GUIDE   = 0x1053
-} ioPadBdCode;
 
 
 static const uint8_t bd_to_local_map[256] = {
@@ -1041,19 +1319,19 @@ handle_kb(glw_ps3_t *gp)
 
 	  if(0) TRACE(TRACE_DEBUG, "PS3", "Keystrike %x %x %x %x",
 		      gp->kb_config[i].mapping,
-		      kbdata.mkey.mkeys,
-		      kbdata.led.leds,
+		      kbdata.mkey._KbMkeyU.mkeys,
+		      kbdata.led._KbLedU.leds,
 		      kbdata.keycode[j]);
 
 	  uc = ioKbCnvRawCode(gp->kb_config[i].mapping, kbdata.mkey,
 			      kbdata.led, kbdata.keycode[j]);
 
 	  mods = 0;
-	  if(kbdata.mkey.l_shift || kbdata.mkey.r_shift)
+	  if(kbdata.mkey._KbMkeyU._KbMkeyS.l_shift || kbdata.mkey._KbMkeyU._KbMkeyS.r_shift)
 	    mods |= KB_SHIFTMASK;
-	  if(kbdata.mkey.l_alt || kbdata.mkey.r_alt)
+	  if(kbdata.mkey._KbMkeyU._KbMkeyS.l_alt || kbdata.mkey._KbMkeyU._KbMkeyS.r_alt)
 	    mods |= KB_ALTMASK;
-	  if(kbdata.mkey.l_ctrl || kbdata.mkey.r_ctrl)
+	  if(kbdata.mkey._KbMkeyU._KbMkeyS.l_ctrl || kbdata.mkey._KbMkeyU._KbMkeyS.r_ctrl)
 	    mods |= KB_CTRLMASK;
 
 	  for(i = 0; i < sizeof(kb2action) / sizeof(*kb2action); i++) {
@@ -1106,7 +1384,23 @@ handle_kb(glw_ps3_t *gp)
 
 
 /**
+ * @brief Core render, input dispatch, and event pump loop for PS3 user interface.
  *
+ * Implements non-blocking first-frame flip status priming followed by double-buffered
+ * frame rasterization and VSYNC pacing. Coordinates Sixaxis/DS3 controller polling,
+ * USB keyboard input dispatch, and PSL1GHT v2 system utility callback processing.
+ *
+ * @param gp Pointer to active PS3 UI context state.
+ *
+ * Algorithmic & Timing Invariants:
+ * - On the first frame (first_fb == 1), gcmResetFlipStatus() primes the display register
+ *   without blocking in waitFlip(), allowing drawFrame() to queue the initial rasterization commands.
+ * - On subsequent frames (first_fb == 0), waitFlip() ensures hardware VSYNC display scanout
+ *   synchronization before next frame rasterization begins.
+ *
+ * Complexity:
+ * - Time Complexity: O(F * N) where F is the number of rendered frames and N is widget tree size.
+ * - Space Complexity: O(1) stack overhead.
  */
 static void
 glw_ps3_mainloop(glw_ps3_t *gp)
@@ -1114,9 +1408,11 @@ glw_ps3_mainloop(glw_ps3_t *gp)
   int currentBuffer = 0;
   TRACE(TRACE_DEBUG, "GLW", "Entering mainloop");
 
+  /* Reset first-frame guard flag to ensure proper initial flip initialization */
+  first_fb = 1;
 
-
-  sysRegisterCallback(EVENT_SLOT0, eventHandle, gp);
+  /* Register PSL1GHT v2 system utility callback */
+  sysUtilRegisterCallback(SYSUTIL_EVENT_SLOT0, eventHandle, gp);
   while(gp->gp_stop != 10) {
 
     if(gp->gp_stop)
@@ -1125,18 +1421,20 @@ glw_ps3_mainloop(glw_ps3_t *gp)
     handle_pads(gp);
     handle_kb(gp);
 
-    waitFlip();
+    /* Render and flip single frame; flip() handles VSYNC synchronization and command buffer reset */
     drawFrame(gp, currentBuffer, 1);
     flip(gp, currentBuffer);
     currentBuffer = !currentBuffer;
-    sysCheckCallback();
+    sysUtilCheckCallback();
   }
-  waitFlip();
+
+  /* Render final blank frame on shutdown */
   drawFrame(gp, currentBuffer, 0);
   flip(gp, currentBuffer);
   currentBuffer = !currentBuffer;
 
-  sysUnregisterCallback(EVENT_SLOT0);
+  /* Unregister callback before teardown */
+  sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT0);
 }
 
 
