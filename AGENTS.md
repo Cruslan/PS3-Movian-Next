@@ -567,3 +567,17 @@ Upgrading to **FFmpeg 4.4 LTS** represents the ideal engineering balance. It pro
 4. **Documentation Synchronization:**
    * Updated [README.md](file:///mnt/nvme1n1p1/Build/movian/README.md) across build artifact tables and manual installation guides.
    * Regenerated release notes at [/home/cruslan/Desktop/RELEASE_v1.0.0.md](file:///home/cruslan/Desktop/RELEASE_v1.0.0.md) with updated package names, download anchors, and verified SHA256 hashes.
+
+---
+
+## 28. Git Primary Branch Modernization (`master` -> `main`) (Completed)
+
+### Motivation & Standards Compliance
+* In alignment with modern Git governance standards and GitHub repository best practices, the primary active development branch has been migrated from `master` to `main`.
+
+### Operations Executed
+1. **Local Branch Renaming:** Renamed local primary branch to `main` via `git branch -M main`.
+2. **Upstream Publication & Tracking:** Pushed branch to `origin/main` and configured tracking via `git push -u origin main`.
+3. **Commit & Tag Alignment:** Verified full commit history parity (`213939a56`) and release tag `v1.0.0` association.
+4. **Default Branch Transition Guidance:** Because GitHub protects the default branch from deletion via remote push (`refusing to delete the current branch`), switching the default branch to `main` under GitHub Repository Settings (`Settings -> Branches -> Default branch`) enables the final removal of the legacy `master` branch.
+
