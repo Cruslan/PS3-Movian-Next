@@ -169,8 +169,8 @@ Upon successful completion, all build artifacts are generated inside `build.ps3/
 | Output File | Description | Target Deployment |
 | :--- | :--- | :--- |
 | `build.ps3/pkg/USRDIR/EBOOT.BIN` | Standalone stripped, relocated & NPDRM signed executable | RPCS3 `dev_hdd0` / USB testing |
-| `build.ps3/movian.pkg` | Standard Retail / HEN installable package | PS3 Package Manager (Retail / HEN) |
-| `build.ps3/movian_geohot.pkg` | Geohot-signed Custom Firmware package | PS3 Custom Firmware (Evilnat, Rebug, Cobra) |
+| `build.ps3/movian-next.pkg` | Standard Retail / HEN installable package | PS3 Package Manager (Retail / HEN) |
+| `build.ps3/movian-next_geohot.pkg` | Geohot-signed Custom Firmware package | PS3 Custom Firmware (Evilnat, Rebug, Cobra) |
 | `build.ps3/PARAM.SFO` | Generated application parameter file (`HTSS00004`) | Package metadata descriptor |
 
 ---
@@ -202,10 +202,10 @@ mkdir -p ~/.config/rpcs3/dev_hdd0/game/HTSS00004/USRDIR
 cp build.ps3/pkg/USRDIR/EBOOT.BIN ~/.config/rpcs3/dev_hdd0/game/HTSS00004/USRDIR/
 ```
 
-Alternatively, drag and drop `build.ps3/movian.pkg` directly into the RPCS3 main window.
+Alternatively, drag and drop `build.ps3/movian-next.pkg` directly into the RPCS3 main window.
 
 ### 2. Physical PlayStation 3 Hardware (CFW & PS3HEN)
-1. Copy `movian.pkg` (or `movian_geohot.pkg` for CFW systems) to the root directory of a FAT32 or exFAT USB flash drive.
+1. Copy `movian-next.pkg` (or `movian-next_geohot.pkg` for CFW systems) to the root directory of a FAT32 or exFAT USB flash drive.
 2. Insert the USB drive into your PS3 (the port closest to the Blu-ray drive is recommended).
 3. On the PS3 XMB menu, navigate to **Game > Package Manager > Install Package Files > Standard**.
 4. Select `Movian Next` to install. Once installation finishes, the player will appear directly under the **Game** column.

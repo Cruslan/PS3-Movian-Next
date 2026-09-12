@@ -528,8 +528,42 @@ Upgrading to **FFmpeg 4.4 LTS** represents the ideal engineering balance. It pro
 * **Compiler Flag Alignment:** Adjusted [README.md](file:///mnt/nvme1n1p1/Build/movian/README.md) to accurately depict `OPTFLAGS ?= -mcpu=cell -O2` alongside `CFLAGS_cfg += -mminimal-toc -fno-strict-aliasing`, mirroring the exact variable assignments in the build system.
 * **Push Readiness Verdict:** Both `README.md` and `Makefile` are fully aligned, verified, and completely suitable for immediate upstream Git commit and push.
 
+---
+
+## 26. Private Repository Deployment (`Cruslan/PS3-Movian-Next.git`) & Official Release v1.0.0 Packaging (Completed)
+
+### Operations Executed
+* **Remote Reconfiguration:** Directed `origin` to `https://github.com/Cruslan/PS3-Movian-Next.git`.
+* **Repository Staging & Commit:** Cleanly committed 458 files (+3,634 / -108,988 lines), staging all modernized PlayStation 3 modules, [README.md](file:///mnt/nvme1n1p1/Build/movian/README.md), [AGENTS.md](file:///mnt/nvme1n1p1/Build/movian/AGENTS.md), and [src/config.h](file:///mnt/nvme1n1p1/Build/movian/src/config.h) while shielding toolchains via [.gitignore](file:///mnt/nvme1n1p1/Build/movian/.gitignore).
+* **Upstream Push:** Successfully pushed `master` branch (79,209 objects) to the private GitHub repository.
+* **Release Tagging:** Created and pushed annotated Git tag `v1.0.0` (`git tag -a v1.0.0`).
+* **Desktop Release Documentation:** Generated comprehensive GitHub Release notes at [/home/cruslan/Desktop/RELEASE_v1.0.0.md](file:///home/cruslan/Desktop/RELEASE_v1.0.0.md), including complete SHA256 checksums, package verification data, format compatibility tables, and installation instructions for RPCS3 and CFW/HEN PS3 hardware.
 
 
+---
 
+## 27. Package Deliverables Standardization to `movian-next.pkg` & `movian-next_geohot.pkg` (Completed)
 
+### Motivation & Architectural Decoupling
+* **Deliverable Naming Consistency:** To clearly distinguish modern Movian Next distribution packages from legacy Movian 5.x releases on user storage and file managers, package artifacts have been standardized with the `movian-next` prefix rather than generic `movian`.
+* **Clean Namespace Separation:** Defined `PKGNAME ?= movian-next` in [Makefile](file:///mnt/nvme1n1p1/Build/movian/Makefile) decoupled from internal ELF binary targets (`APPNAME := movian` -> `movian.elf` / `movian.bundle`). This avoids touching internal linker maps, symbol tables, or build intermediate paths while producing cleanly branded user packages.
 
+### Build Orchestration & Deliverable Updates
+1. **Makefile Targets & Packaging Rules:**
+   * Updated `PKG_FILE := $(BUILDDIR)/$(PKGNAME).pkg` (`build.ps3/movian-next.pkg`).
+   * Updated `GEOHOT_PKG := $(BUILDDIR)/$(PKGNAME)_geohot.pkg` (`build.ps3/movian-next_geohot.pkg`).
+   * Updated `install:` target to copy `$(BUILDDIR)/$(PKGNAME).pkg` to `$(PS3INSTALL)/$(PKGNAME).pkg`.
+   * Expanded `CLEAN_TARGETS` to clean `$(BUILDDIR)/$(PKGNAME).*` and `$(BUILDDIR)/$(PKGNAME)_*`.
+2. **Compilation & Packaging Verification:**
+   * Executed clean compilation via `make pkg -j12` with zero errors and zero warnings.
+   * Generated retail package `build.ps3/movian-next.pkg` (7.7 MB) and CFW package `build.ps3/movian-next_geohot.pkg` (7.7 MB).
+3. **Artifact Deployment & Cryptographic Verification:**
+   * Deployed both updated packages directly to Desktop (`/home/cruslan/Desktop/movian-next.pkg` and `/home/cruslan/Desktop/movian-next_geohot.pkg`).
+   * Safely cleared legacy `movian.pkg` and `movian_geohot.pkg` files from Desktop.
+   * Cryptographic verification:
+     * `movian-next.pkg`: `dea4a2afd83c711b61af06e898a3b236d79b8e2a03d4c2a585c152cca1296f7e` (7,969,264 bytes)
+     * `movian-next_geohot.pkg`: `5b0f3bb5a05acf212e59969429ccc208ca88b3302b2ef080982ca57307a6df79` (7,969,264 bytes)
+     * `EBOOT.BIN`: `95f6120d7d5af9e40d699f12bd9a2ebc6c7e8c92737cf0b4b03a45e349af548c` (7,952,016 bytes)
+4. **Documentation Synchronization:**
+   * Updated [README.md](file:///mnt/nvme1n1p1/Build/movian/README.md) across build artifact tables and manual installation guides.
+   * Regenerated release notes at [/home/cruslan/Desktop/RELEASE_v1.0.0.md](file:///home/cruslan/Desktop/RELEASE_v1.0.0.md) with updated package names, download anchors, and verified SHA256 hashes.

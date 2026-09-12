@@ -35,6 +35,7 @@ CONTENTID	:= UP0001-$(APPID)_00-0000000000000000
 APPNAME		:= movian
 APPNAMEUSER	:= Movian Next
 APPVER		?= 1.0
+PKGNAME		?= movian-next
 ICON0		:= $(CURDIR)/support/ps3icon.png
 SFOXML		:= $(CURDIR)/support/sfo.xml
 
@@ -877,8 +878,8 @@ ELF         := $(BUILDDIR)/$(APPNAME).elf
 BUNDLE_ELF  := $(BUILDDIR)/$(APPNAME).bundle
 SELF        := $(BUILDDIR)/$(APPNAME).self
 SYMS        := $(BUILDDIR)/$(APPNAME).syms
-PKG_FILE    := $(BUILDDIR)/$(APPNAME).pkg
-GEOHOT_PKG  := $(BUILDDIR)/$(APPNAME)_geohot.pkg
+PKG_FILE    := $(BUILDDIR)/$(PKGNAME).pkg
+GEOHOT_PKG  := $(BUILDDIR)/$(PKGNAME)_geohot.pkg
 
 all: pkg
 
@@ -922,7 +923,7 @@ self: $(SELF)
 eboot: $(EBOOT)
 
 install: $(PKG_FILE)
-	cp $< $(PS3INSTALL)/$(APPNAME).pkg
+	cp $< $(PS3INSTALL)/$(PKGNAME).pkg
 	sync
 
 CLEAN_TARGETS = $(BUILDDIR)/src \
@@ -932,6 +933,8 @@ CLEAN_TARGETS = $(BUILDDIR)/src \
 		$(BUILDDIR)/stamps \
 		$(BUILDDIR)/$(APPNAME) \
 		$(BUILDDIR)/$(APPNAME).* \
+		$(BUILDDIR)/$(PKGNAME).* \
+		$(BUILDDIR)/$(PKGNAME)_* \
 		$(BUILDDIR)/EBOOT.BIN \
 		$(BUILDDIR)/PARAM.SFO \
 		$(BUILDDIR)/ICON0.PNG \
