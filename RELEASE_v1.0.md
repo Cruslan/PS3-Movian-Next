@@ -1,6 +1,6 @@
-# Movian Next v1.1.0 (PlayStation 3 Modern Edition)
+# Movian Next v1.0 (PlayStation 3 Modern Edition)
 
-**Release Version:** v1.1.0  
+**Release Version:** v1.0  
 **Title ID:** `HTSS00004` (Content-ID: `UP0001-HTSS00004_00-0000000000000000`)  
 **Target Platform:** Sony PlayStation 3 (Custom Firmware & PS3HEN) / RPCS3  
 **Target Architecture:** Cell Broadband Engine (PPE + 6 User SPUs) & RSX GPU (NV47/G70)  
@@ -10,7 +10,7 @@
 
 ## Overview
 
-**Movian Next v1.1.0** represents a major architectural milestone in the modernization of the celebrated Movian (formerly Showtime) media player for PlayStation 3. This release completely retires the legacy Libav 11 multimedia core, transitioning entirely to modern **FFmpeg 9.0 ("Lei")** compiled natively for the Cell Broadband Engine architecture. Coupled with whole-program Link-Time Optimization (`-flto`), next-generation codec handling with interactive confirmation dialogs, IVF container demuxing, and modern audio resampling (`libswresample`), v1.1.0 delivers the most resilient and performant homebrew media experience available on PS3 hardware.
+**Movian Next v1.0** represents a major architectural milestone in the modernization of the celebrated Movian (formerly Showtime) media player for PlayStation 3. This release completely retires the legacy Libav 11 multimedia core, transitioning entirely to modern **FFmpeg 9.0 ("Lei")** compiled natively for the Cell Broadband Engine architecture. Coupled with whole-program Link-Time Optimization (`-flto`), next-generation codec handling with interactive confirmation dialogs, IVF container demuxing, and modern audio resampling (`libswresample`), v1.0 delivers the most resilient and performant homebrew media experience available on PS3 hardware.
 
 ---
 
@@ -20,13 +20,13 @@ All packages have been built, signed, and validated with zero compiler warnings/
 
 | File Name | Format / Target | Size | SHA-256 Checksum |
 | :--- | :--- | :--- | :--- |
-| **`movian-next.pkg`** | Retail / PS3HEN Standard Package | 7.7 MB | `441bfa91cd0e042d42082cbc25dcb280171cc499d88ea47ae7ff6b9d8d043101` |
-| **`movian-next_geohot.pkg`** | CFW Finalized (Evilnat / Rebug / Cobra) | 7.7 MB | `9ffff27afef72785c70bf263df5f6a77447f67a279c6437566d6d13e6abac690` |
-| **`EBOOT.BIN`** | Standalone Executable (RPCS3 / USB) | 7.7 MB | `0cf337d6dd2e446d2cbc6a55053f3e6bf51c3255478233fd378a42b55d59268d` |
+| **`movian-next.pkg`** | Retail / PS3HEN Standard Package | 7.7 MB | `d9c315387dcb6e0e3a34d343b93607cfd79d18669b22940b08edbee8ea6291fa` |
+| **`movian-next_geohot.pkg`** | CFW Finalized (Evilnat / Rebug / Cobra) | 7.7 MB | `3b9a8d132554e03fca1cf3a1a548c8ee790d5d280a751828ce7923378f590986` |
+| **`EBOOT.BIN`** | Standalone Executable (RPCS3 / USB) | 7.7 MB | `eb4d9510fc094317e7e7cd4a672b2cf985c96acd7f9666afea3da13341a99b96` |
 
 ---
 
-## Key Highlights & Changelog in v1.1.0
+## Key Highlights & Changelog in v1.0
 
 ### 1. Modern FFmpeg 9.0 ("Lei") Multimedia Core
 * **Full Libav 11 Retirement:** Migrated the entire core decoding, demuxing, parsing, and resampling infrastructure to modern FFmpeg 9.0 static libraries (`libavcodec.a`, `libavformat.a`, `libavutil.a`, `libswscale.a`, `libswresample.a`).

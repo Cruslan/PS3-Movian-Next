@@ -1,7 +1,7 @@
 <?xml version="1.0" ?>
 <sfo>
 	<value name="APP_VER" type="string">
-		01.10
+		01.00
 	</value>
 	<value name="ATTRIBUTE" type="integer">
 		5
@@ -34,6 +34,6 @@
 		HTSS00004
 	</value>
 	<value name="VERSION" type="string">
-		01.10
+		01.00
 	</value>
 </sfo>
