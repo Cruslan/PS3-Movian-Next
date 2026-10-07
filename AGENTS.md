@@ -1807,5 +1807,20 @@ Transitioning from GCC 7.2.0 to GCC 13.2.0 with `-Wall -Werror` required resolvi
 * Deployed `EBOOT.BIN` to RPCS3 (`dev_hdd0/game/HTSS00004/USRDIR/EBOOT.BIN`).
 * Transferred to physical PS3 hardware (`<PS3_IP>`) via curl FTP and dispatched webMAN MOD on-screen notification popup.
 
+---
+
+## 65. Official Release v1.1.0 Packaging & Deliverables Deployment (Completed)
+
+### 1. Release Scope & Version Bump
+* Updated `APPVER ?= 1.1.0` in [Makefile](Makefile) and `APP_VER` / `VERSION` to `01.10` in [support/sfo.xml](support/sfo.xml).
+* Executed full monolithic compilation (`make -j12 all`). Built signed retail/HEN package (`movian-next.pkg`), CFW finalized package (`movian-next_geohot.pkg`), and NPDRM signed `EBOOT.BIN` with zero warnings/errors.
+* Deployed both `.pkg` packages and comprehensive release notes ([RELEASE_v1.1.0.md](RELEASE_v1.1.0.md)) to Desktop for distribution.
+
+### 2. Verified Deliverables & SHA256 Checksums
+* **`movian-next.pkg`** (7.7 MB): `441bfa91cd0e042d42082cbc25dcb280171cc499d88ea47ae7ff6b9d8d043101`
+* **`movian-next_geohot.pkg`** (7.7 MB): `9ffff27afef72785c70bf263df5f6a77447f67a279c6437566d6d13e6abac690`
+* **`EBOOT.BIN`** (7.7 MB): `0cf337d6dd2e446d2cbc6a55053f3e6bf51c3255478233fd378a42b55d59268d`
+
+
 
 
