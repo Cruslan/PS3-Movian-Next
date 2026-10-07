@@ -168,9 +168,8 @@ cd PS3-Movian-Next
 # 2. Bootstrap the hermetic PSL1GHT v2 SDK (installs into ./ps3dev if no system SDK is found)
 make prepare
 
-# 3. Build the complete application and PS3 packages (make all or make pkg)
+# 3. Build the complete application and PS3 packages
 make -j$(nproc) all
-# or: make -j$(nproc) pkg
 ```
 
 ### Generated Build Deliverables
@@ -192,7 +191,7 @@ The monolithic build system provides intuitive multi-tier maintenance and clean 
 
 | Target | Description |
 | :--- | :--- |
-| `make pkg` | **Default target (`all`).** Compiles C/ASM sources, FFmpeg static core, bundles assets, links executable, signs `EBOOT.BIN`, and builds `.pkg` packages. |
+| `make all` / `make pkg` | **Default target.** Compiles C/ASM sources, FFmpeg static core, bundles assets, links executable, signs `EBOOT.BIN`, and builds `.pkg` packages. |
 | `make eboot` | Compiles application code and generates the standalone signed `EBOOT.BIN`. |
 | `make self` | Compiles and generates standard unencrypted `movian.self`. |
 | `make elf` | Preserves and builds relocated `movian.bundle` ELF binary. |
