@@ -168,8 +168,9 @@ cd PS3-Movian-Next
 # 2. Bootstrap the hermetic PSL1GHT v2 SDK (installs into ./ps3dev if no system SDK is found)
 make prepare
 
-# 3. Build the complete application and PS3 packages (using parallel threads)
-make -j$(nproc)
+# 3. Build the complete application and PS3 packages (make all or make pkg)
+make -j$(nproc) all
+# or: make -j$(nproc) pkg
 ```
 
 ### Generated Build Deliverables
