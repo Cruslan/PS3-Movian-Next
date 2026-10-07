@@ -36,6 +36,8 @@ struct AVFormatContext *fa_libav_open_format(AVIOContext *avio,
 #define FA_LIBAV_OPEN_STRATEGY_AUDIO              1
 #define FA_LIBAV_OPEN_STRATEGY_VIDEO_NON_SEEKABLE 2
 #define FA_LIBAV_OPEN_STRATEGY_VIDEO_SEEKABLE     3
+#define FA_LIBAV_OPEN_STRATEGY_THUMBNAIL          4
+#define FA_LIBAV_OPEN_STRATEGY_PROBE              5
 
 void fa_libav_close_format(struct AVFormatContext *fctx, int park);
 

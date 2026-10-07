@@ -20,8 +20,10 @@
 #include <unistd.h>
 #include <assert.h>
 #include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
 #include <libavutil/mathematics.h>
-#include <libavresample/avresample.h>
+#include <libswresample/swresample.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
 #include <libavutil/mem.h>
 
@@ -58,7 +60,8 @@ typedef struct audio_source {
   int as_format;
   int64_t as_channel_layout;
   int as_sample_rate;
-  AVAudioResampleContext *as_avr;
+  /** Modern FFmpeg audio resampler context */
+  SwrContext *as_avr;
   struct audio_buf_queue as_queue;
 
 
@@ -85,7 +88,7 @@ struct glw_rec {
 
   LIST_ENTRY(glw_rec) global_link;
   char *filename;
-  AVOutputFormat *fmt;
+  const AVOutputFormat *fmt;
   AVFormatContext *oc;
 
   AVCodecContext *v_ctx;
@@ -116,15 +119,24 @@ struct glw_rec {
 /**
  *
  */
+/**
+ * @brief Emits buffered audio samples into the recording stream.
+ *
+ * Pulls accumulated PCM audio samples from registered audio sources, mixes them
+ * into an interleaved 16-bit stereo buffer, packages them into an AVFrame,
+ * and submits them to the modern FFmpeg audio encoder using avcodec_send_frame()
+ * and avcodec_receive_packet().
+ *
+ * @param gr Recording context.
+ * @param pts Presentation timestamp boundary up to which audio should be processed.
+ */
 static void
 emit_audio(glw_rec_t *gr, int64_t pts)
 {
 #define SAMPLES_PER_FRAME 1024
   int16_t data[SAMPLES_PER_FRAME * 2];
 
-
   while(1) {
-
     memset(data, 0, sizeof(data));
 
     hts_mutex_lock(&glw_rec_mutex);
@@ -143,16 +155,10 @@ emit_audio(glw_rec_t *gr, int64_t pts)
       while(as->as_samples_queued > 0 && offset < SAMPLES_PER_FRAME) {
         audio_buf_t *ab = TAILQ_FIRST(&as->as_queue);
 
-
         if(ab->ab_ts != AV_NOPTS_VALUE) {
-          if(as->as_last_ts != AV_NOPTS_VALUE) {
-
-          }
           as->as_last_ts = ab->ab_ts;
           as->as_last_ts_sample = as->as_samples_consumed;
-
         }
-
 
         int consume = MIN(ab->ab_samples - ab->ab_used,
                           SAMPLES_PER_FRAME - offset);
@@ -176,36 +182,40 @@ emit_audio(glw_rec_t *gr, int64_t pts)
 
     hts_mutex_unlock(&glw_rec_mutex);
 
-    AVPacket pkt;
-    AVFrame frame;
-    memset(&frame, 0, sizeof(frame));
-
-    av_init_packet(&pkt);
-    pkt.data = NULL;
-    pkt.size = 0;
-
     int64_t ts = av_rescale_q(gr->samples_written,
                               (AVRational){1, 48000},
                               gr->a_st->time_base);
 
-
     if(ts >= 0) {
+      AVFrame *frame = av_frame_alloc();
+      AVPacket *pkt = av_packet_alloc();
 
-      frame.data[0] = (void *)data;
-      frame.nb_samples = SAMPLES_PER_FRAME;
+      if(frame != NULL && pkt != NULL) {
+        frame->nb_samples = SAMPLES_PER_FRAME;
+        frame->format = gr->a_ctx->sample_fmt;
+        av_channel_layout_copy(&frame->ch_layout, &gr->a_ctx->ch_layout);
+        frame->sample_rate = gr->a_ctx->sample_rate;
+        frame->pts = ts;
 
-      int got_packet;
-      int r = avcodec_encode_audio2(gr->a_ctx, &pkt, &frame, &got_packet);
-      if(r < 0 || !got_packet)
-        abort();
+        if(av_frame_get_buffer(frame, 0) >= 0) {
+          memcpy(frame->data[0], data, SAMPLES_PER_FRAME * 2 * sizeof(int16_t));
 
+          /* Submit PCM audio frame to encoder */
+          if(avcodec_send_frame(gr->a_ctx, frame) >= 0) {
+            while(avcodec_receive_packet(gr->a_ctx, pkt) == 0) {
+              pkt->stream_index = gr->a_st->index;
+              av_packet_rescale_ts(pkt, gr->a_ctx->time_base, gr->a_st->time_base);
+              av_interleaved_write_frame(gr->oc, pkt);
+              av_packet_unref(pkt);
+            }
+          }
+        }
+      }
 
-      pkt.pts = pkt.dts = ts;
-      pkt.stream_index = gr->a_st->index;
-      pkt.duration = av_rescale_q(1, (AVRational){SAMPLES_PER_FRAME, 48000},
-                                  gr->v_st->time_base);
-      av_interleaved_write_frame(gr->oc, &pkt);
-      av_free_packet(&pkt);
+      if(frame != NULL)
+        av_frame_free(&frame);
+      if(pkt != NULL)
+        av_packet_free(&pkt);
     }
 
     gr->samples_written += SAMPLES_PER_FRAME;
@@ -220,59 +230,70 @@ emit_audio(glw_rec_t *gr, int64_t pts)
 
 
 /**
+ * @brief Encodes a raw video pixmap frame into the recording container.
  *
+ * Allocates a modern AVFrame, attaches the pixmap scanline buffers, timestamps
+ * the frame, and feeds it into the video encoder pipeline via avcodec_send_frame().
+ * Encoded bitstream packets are collected via avcodec_receive_packet() and
+ * written to the muxer container.
+ *
+ * @param gr Recording context.
+ * @param pm Raw UI pixmap containing the captured frame.
  */
 static void
 encode_vframe(glw_rec_t *gr, struct pixmap *pm)
 {
-  int r;
-  AVPacket pkt;
-  AVFrame frame;
+  AVFrame *frame = av_frame_alloc();
+  AVPacket *pkt = av_packet_alloc();
 
-  memset(&frame, 0, sizeof(frame));
+  if(frame == NULL || pkt == NULL) {
+    if(frame != NULL) av_frame_free(&frame);
+    if(pkt != NULL) av_packet_free(&pkt);
+    return;
+  }
 
-  frame.data[0] = pm->pm_data + pm->pm_linesize * (gr->height - 1);
-  frame.linesize[0] = -pm->pm_linesize;
-  frame.pts = 1000000LL * gr->framenum / gr->fps;
+  frame->format = gr->v_ctx->pix_fmt;
+  frame->width = gr->width;
+  frame->height = gr->height;
+  frame->data[0] = pm->pm_data + pm->pm_linesize * (gr->height - 1);
+  frame->linesize[0] = -pm->pm_linesize;
+  frame->pts = 1000000LL * gr->framenum / gr->fps;
   gr->framenum++;
 
-  av_init_packet(&pkt);
-  pkt.data = NULL;    // packet data will be allocated by the encoder
-  pkt.size = 0;
+  int64_t pts = frame->pts;
 
-  int got_packet;
-  r = avcodec_encode_video2(gr->v_ctx, &pkt, &frame, &got_packet);
-  if(r < 0 || !got_packet)
-    return;
+  /* Dispatch raw video frame into modern FFmpeg encoder */
+  if(avcodec_send_frame(gr->v_ctx, frame) >= 0) {
+    while(avcodec_receive_packet(gr->v_ctx, pkt) == 0) {
+      pkt->stream_index = gr->v_st->index;
+      av_packet_rescale_ts(pkt, gr->v_ctx->time_base, gr->v_st->time_base);
+      av_interleaved_write_frame(gr->oc, pkt);
+      av_packet_unref(pkt);
+    }
+  }
 
-  int64_t pts = gr->v_ctx->coded_frame->pts;
-  if(pts == AV_NOPTS_VALUE)
-    pts = frame.pts;
-
-  pkt.dts = pkt.pts = av_rescale_q(pts,
-                                   AV_TIME_BASE_Q, gr->v_st->time_base);
-
-  if(gr->v_ctx->coded_frame->key_frame)
-    pkt.flags |= AV_PKT_FLAG_KEY;
-
-  pkt.stream_index = gr->v_st->index;
-  pkt.duration = av_rescale_q(1, (AVRational){1, gr->fps}, gr->v_st->time_base);
-  av_interleaved_write_frame(gr->oc, &pkt);
-  av_free_packet(&pkt);
+  av_frame_free(&frame);
+  av_packet_free(&pkt);
 
   emit_audio(gr, pts);
 }
 
 
 /**
+ * @brief Background recording thread function.
  *
+ * Allocates modern FFmpeg format and codec contexts, initializes video and audio
+ * encoders (FFVHUFF and PCM S16LE), writes container headers, processes queued UI
+ * frames in a loop, and cleanly flushes/finalizes the recording output on termination.
+ *
+ * @param aux Pointer to glw_rec_t recording structure.
+ * @return NULL on thread exit.
  */
 static void *
 rec_thread(void *aux)
 {
   glw_rec_t *gr = aux;
   video_frame_t *vf;
-
 
   gr->fmt = av_guess_format(NULL, gr->filename, NULL);
   if(gr->fmt == NULL) {
@@ -282,72 +303,118 @@ rec_thread(void *aux)
     return NULL;
   }
 
-  gr->oc = avformat_alloc_context();
-  gr->oc->oformat = gr->fmt;
-  snprintf(gr->oc->filename, sizeof(gr->oc->filename), "%s", gr->filename);
+  if(avformat_alloc_output_context2(&gr->oc, gr->fmt, NULL, gr->filename) < 0 || gr->oc == NULL) {
+    TRACE(TRACE_ERROR, "REC",
+	  "Unable to allocate output context for %s",
+	  gr->filename);
+    return NULL;
+  }
 
-  gr->v_st = avformat_new_stream(gr->oc, 0);
+  /* Initialize video stream and encoder */
+  const AVCodec *v_codec = avcodec_find_encoder(AV_CODEC_ID_FFVHUFF);
+  if(v_codec == NULL) {
+    TRACE(TRACE_ERROR, "REC", "Unable to find FFVHUFF encoder");
+    return NULL;
+  }
+
+  gr->v_st = avformat_new_stream(gr->oc, NULL);
+  if(gr->v_st == NULL)
+    return NULL;
 
   gr->v_st->avg_frame_rate.num = gr->fps;
   gr->v_st->avg_frame_rate.den = 1;
 
-  gr->v_ctx = gr->v_st->codec;
+  gr->v_ctx = avcodec_alloc_context3(v_codec);
+  if(gr->v_ctx == NULL)
+    return NULL;
+
   gr->v_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
   gr->v_ctx->codec_id = AV_CODEC_ID_FFVHUFF;
-
   gr->v_ctx->width = gr->width;
   gr->v_ctx->height = gr->height;
   gr->v_ctx->time_base.den = gr->fps;
   gr->v_ctx->time_base.num = 1;
   gr->v_ctx->pix_fmt = AV_PIX_FMT_RGB32;
-  gr->v_ctx->coder_type = 0;
+  gr->v_ctx->thread_count = gconf.concurrency;
 
-  AVCodec *c = avcodec_find_encoder(gr->v_ctx->codec_id);
-  if(avcodec_open2(gr->v_ctx, c, NULL)) {
+  if(gr->oc->oformat->flags & AVFMT_GLOBALHEADER)
+    gr->v_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+  if(avcodec_open2(gr->v_ctx, v_codec, NULL) < 0) {
     TRACE(TRACE_ERROR, "REC",
 	  "Unable to record to %s -- Unable to open video codec",
 	  gr->filename);
     return NULL;
   }
 
-  gr->v_ctx->thread_count = gconf.concurrency;
+  avcodec_parameters_from_context(gr->v_st->codecpar, gr->v_ctx);
+  gr->v_st->time_base = gr->v_ctx->time_base;
 
-  gr->a_st = avformat_new_stream(gr->oc, 0);
+  /* Initialize audio stream and encoder */
+  const AVCodec *a_codec = avcodec_find_encoder(AV_CODEC_ID_PCM_S16LE);
+  if(a_codec == NULL) {
+    TRACE(TRACE_ERROR, "REC", "Unable to find PCM_S16LE encoder");
+    return NULL;
+  }
 
-  gr->a_ctx = gr->a_st->codec;
+  gr->a_st = avformat_new_stream(gr->oc, NULL);
+  if(gr->a_st == NULL)
+    return NULL;
+
+  gr->a_ctx = avcodec_alloc_context3(a_codec);
+  if(gr->a_ctx == NULL)
+    return NULL;
+
   gr->a_ctx->codec_type = AVMEDIA_TYPE_AUDIO;
   gr->a_ctx->codec_id = AV_CODEC_ID_PCM_S16LE;
-
   gr->a_ctx->sample_rate = 48000;
   gr->a_ctx->sample_fmt = AV_SAMPLE_FMT_S16;
-  gr->a_ctx->channel_layout = AV_CH_LAYOUT_STEREO;
+  av_channel_layout_default(&gr->a_ctx->ch_layout, 2);
   gr->a_ctx->time_base.den = 48000;
   gr->a_ctx->time_base.num = 1;
 
-  c = avcodec_find_encoder(gr->a_ctx->codec_id);
-  if(avcodec_open2(gr->a_ctx, c, NULL)) {
+  if(gr->oc->oformat->flags & AVFMT_GLOBALHEADER)
+    gr->a_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+  gr->a_ctx->thread_count = 1;
+  if(avcodec_open2(gr->a_ctx, a_codec, NULL) < 0) {
     TRACE(TRACE_ERROR, "REC",
 	  "Unable to record to %s -- Unable to open audio codec",
 	  gr->filename);
     return NULL;
   }
 
-  gr->v_ctx->thread_count = gconf.concurrency;
-
-  // Output output file
+  avcodec_parameters_from_context(gr->a_st->codecpar, gr->a_ctx);
+  gr->a_st->time_base = gr->a_ctx->time_base;
 
   av_dump_format(gr->oc, 0, gr->filename, 1);
 
-  if(avio_open(&gr->oc->pb, gr->filename, AVIO_FLAG_WRITE) < 0) {
-    TRACE(TRACE_ERROR, "REC",
-	  "Unable to record to %s -- Unable to open file for writing",
-	  gr->filename);
-    return NULL;
+  if(!(gr->oc->oformat->flags & AVFMT_NOFILE)) {
+    if(avio_open(&gr->oc->pb, gr->filename, AVIO_FLAG_WRITE) < 0) {
+      TRACE(TRACE_ERROR, "REC",
+	    "Unable to record to %s -- Unable to open file for writing",
+	    gr->filename);
+      return NULL;
+    }
   }
 
-  /* write the stream header, if any */
-  avformat_write_header(gr->oc, NULL);
-
+  /* Write the stream header */
+  if(avformat_write_header(gr->oc, NULL) < 0) {
+    TRACE(TRACE_ERROR, "REC",
+          "Unable to write container header for %s",
+          gr->filename);
+    if(gr->v_ctx != NULL)
+      avcodec_free_context(&gr->v_ctx);
+    if(gr->a_ctx != NULL)
+      avcodec_free_context(&gr->a_ctx);
+    if(gr->oc != NULL && !(gr->oc->oformat->flags & AVFMT_NOFILE))
+      avio_closep(&gr->oc->pb);
+    if(gr->oc != NULL)
+      avformat_free_context(gr->oc);
+    free(gr->filename);
+    free(gr);
+    return NULL;
+  }
 
   hts_mutex_lock(&glw_rec_mutex);
 
@@ -370,15 +437,19 @@ rec_thread(void *aux)
 
   av_write_trailer(gr->oc);
 
-  for(int i = 0; i < gr->oc->nb_streams; i++) {
-    AVStream *st = gr->oc->streams[i];
-    avcodec_close(st->codec);
-    free(st->codec);
-    free(st);
-  }
+  /* Clean up modern contexts */
+  if(gr->v_ctx != NULL)
+    avcodec_free_context(&gr->v_ctx);
+  if(gr->a_ctx != NULL)
+    avcodec_free_context(&gr->a_ctx);
 
-  avio_close(gr->oc->pb);
-  free(gr->oc);
+  if(gr->oc != NULL && !(gr->oc->oformat->flags & AVFMT_NOFILE))
+    avio_closep(&gr->oc->pb);
+
+  if(gr->oc != NULL)
+    avformat_free_context(gr->oc);
+
+  free(gr->filename);
   free(gr);
   return NULL;
 }
@@ -424,7 +495,14 @@ glw_rec_stop(glw_rec_t *gr)
 
 
 /**
+ * @brief Receives decoded audio frames and stages them for the UI recorder.
  *
+ * Configures modern libswresample conversion from source audio sample format,
+ * rate, and channel mask into 48 kHz signed 16-bit interleaved stereo PCM.
+ *
+ * @param ad Decoder instance emitting audio frames.
+ * @param frame Decoded AVFrame containing audio samples, or NULL when stream terminates.
+ * @param pts Frame presentation timestamp.
  */
 void
 glw_rec_audio_send(struct audio_decoder *ad, AVFrame *frame, int64_t pts)
@@ -444,16 +522,22 @@ glw_rec_audio_send(struct audio_decoder *ad, AVFrame *frame, int64_t pts)
         break;
     }
 
-
     if(frame == NULL) {
       if(as == NULL)
         continue;
       LIST_REMOVE(as, as_link);
-      printf("Stream %d stopped\n", as->as_id);
+      if(as->as_avr != NULL)
+        swr_free(&as->as_avr);
+      audio_buf_t *ab;
+      while((ab = TAILQ_FIRST(&as->as_queue)) != NULL) {
+        TAILQ_REMOVE(&as->as_queue, ab, ab_link);
+        free(ab->ab_buf);
+        free(ab);
+      }
+      free(as);
+      printf("Stream %d stopped\n", ad->ad_id);
       continue;
     }
-
-
 
     if(as == NULL) {
       printf("Delay = %d\n", ad->ad_delay);
@@ -464,82 +548,96 @@ glw_rec_audio_send(struct audio_decoder *ad, AVFrame *frame, int64_t pts)
       LIST_INSERT_HEAD(&gr->asources, as, as_link);
       as->as_id = ad->ad_id;
       as->as_start_drop = 24000;
-      as->as_avr = avresample_alloc_context();
     }
 
     if(as->as_format != ad->ad_in_sample_format ||
        as->as_channel_layout != ad->ad_in_channel_layout ||
        as->as_sample_rate != ad->ad_in_sample_rate) {
 
-      avresample_close(as->as_avr);
+      if(as->as_avr != NULL)
+        swr_free(&as->as_avr);
 
       as->as_format = ad->ad_in_sample_format;
       as->as_channel_layout = ad->ad_in_channel_layout;
       as->as_sample_rate = ad->ad_in_sample_rate;
 
-      av_opt_set_int(as->as_avr, "in_sample_fmt",
-                     as->as_format, 0);
-      av_opt_set_int(as->as_avr, "in_sample_rate",
-                     as->as_sample_rate, 0);
-      av_opt_set_int(as->as_avr, "in_channel_layout",
-                     as->as_channel_layout, 0);
+      AVChannelLayout in_layout = {0};
+      AVChannelLayout out_layout = {0};
 
-      av_opt_set_int(as->as_avr, "out_sample_fmt",
-                     AV_SAMPLE_FMT_S16, 0);
-      av_opt_set_int(as->as_avr, "out_sample_rate",
-                     48000, 0);
-      av_opt_set_int(as->as_avr, "out_channel_layout",
-                     AV_CH_LAYOUT_STEREO, 0);
+      av_channel_layout_from_mask(&in_layout, as->as_channel_layout);
+      av_channel_layout_default(&out_layout, 2);
+
+      swr_alloc_set_opts2(&as->as_avr,
+                          &out_layout, AV_SAMPLE_FMT_S16, 48000,
+                          &in_layout, as->as_format, as->as_sample_rate,
+                          0, NULL);
 
       char buf1[128];
+      av_channel_layout_describe(&in_layout, buf1, sizeof(buf1));
 
-      av_get_channel_layout_string(buf1, sizeof(buf1),
-                                   -1, as->as_channel_layout);
+      av_channel_layout_uninit(&in_layout);
+      av_channel_layout_uninit(&out_layout);
 
       TRACE(TRACE_DEBUG, "REC",
             "Converting from [%s %dHz %s]",
             buf1, as->as_sample_rate,
             av_get_sample_fmt_name(as->as_format));
 
-      if(avresample_open(as->as_avr)) {
+      if(as->as_avr == NULL || swr_init(as->as_avr) < 0) {
         TRACE(TRACE_ERROR, "REC", "Unable to open resampler");
-        avresample_free(&as->as_avr);
+        if(as->as_avr != NULL)
+          swr_free(&as->as_avr);
       }
     }
 
     if(as->as_avr == NULL)
       continue;
 
-    avresample_convert(as->as_avr, NULL, 0, 0,
-                       frame->data, frame->linesize[0],
-                       frame->nb_samples);
-
-    int avail = avresample_available(as->as_avr);
-
-    if(avail == 0)
+    int max_out = swr_get_out_samples(as->as_avr, frame->nb_samples);
+    if(max_out <= 0)
       continue;
 
-    if(as->as_start_drop > 0) {
-      avresample_read(as->as_avr, NULL, avail);
-      printf("Dropped %d\n", avail);
-      as->as_start_drop -= avail;
-    } else {
+    int bytes = max_out * sizeof(int16_t) * 2;
+    int16_t *buf = malloc(bytes);
+    if(buf == NULL)
+      continue;
 
-      int bytes = avail * sizeof(int16_t) * 2;  // 16 bit stereo
+    uint8_t *out_planes[1] = { (uint8_t *)buf };
+    int converted = swr_convert(as->as_avr, out_planes, max_out,
+                                (const uint8_t * const *)frame->data,
+                                frame->nb_samples);
 
-      void *buf = malloc(bytes);
-      uint8_t *data[8] = {0};
-      data[0] = (uint8_t *)buf;
-      avresample_read(as->as_avr, data, avail);
-      audio_buf_t *ab = calloc(1, sizeof(audio_buf_t));
-      ab->ab_buf = buf;
-      ab->ab_samples = avail;
-      for(int i = 0; i < avail * 2; i++) {
-        ab->ab_buf[i] *= ad->ad_vol_scale;
+    if(converted > 0) {
+      if(as->as_start_drop > 0) {
+        int drop = MIN(converted, as->as_start_drop);
+        as->as_start_drop -= drop;
 
+        if(converted > drop) {
+          int rem = converted - drop;
+          memmove(buf, buf + drop * 2, rem * sizeof(int16_t) * 2);
+          audio_buf_t *ab = calloc(1, sizeof(audio_buf_t));
+          ab->ab_buf = buf;
+          ab->ab_samples = rem;
+          for(int i = 0; i < rem * 2; i++) {
+            ab->ab_buf[i] *= ad->ad_vol_scale;
+          }
+          TAILQ_INSERT_TAIL(&as->as_queue, ab, ab_link);
+          as->as_samples_queued += rem;
+        } else {
+          free(buf);
+        }
+      } else {
+        audio_buf_t *ab = calloc(1, sizeof(audio_buf_t));
+        ab->ab_buf = buf;
+        ab->ab_samples = converted;
+        for(int i = 0; i < converted * 2; i++) {
+          ab->ab_buf[i] *= ad->ad_vol_scale;
+        }
+        TAILQ_INSERT_TAIL(&as->as_queue, ab, ab_link);
+        as->as_samples_queued += converted;
       }
-      TAILQ_INSERT_TAIL(&as->as_queue, ab, ab_link);
-      as->as_samples_queued += avail;
+    } else {
+      free(buf);
     }
   }
   hts_mutex_unlock(&glw_rec_mutex);

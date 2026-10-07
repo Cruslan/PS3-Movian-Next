@@ -68,7 +68,17 @@ glw_video_rctx_adjust(glw_rctx_t *rc, const glw_video_t *gv)
 		   -gr->gr_underscan_v);
   }
 
-  float t_aspect = (float)gv->gv_dar_num / gv->gv_dar_den;
+  float t_aspect;
+  if(gv->gv_dar_num > 0 && gv->gv_dar_den > 0) {
+    t_aspect = (float)gv->gv_dar_num / (float)gv->gv_dar_den;
+  } else if(gv->gv_width > 0 && gv->gv_height > 0) {
+    t_aspect = (float)gv->gv_width / (float)gv->gv_height;
+  } else {
+    t_aspect = 16.0f / 9.0f;
+  }
+
+  if(isnan(t_aspect) || isinf(t_aspect) || t_aspect <= 0.01f || t_aspect >= 100.0f)
+    t_aspect = 16.0f / 9.0f;
 
   if(gv->gv_fstretch)
     return;
@@ -499,6 +509,12 @@ glw_video_dtor(glw_t *w)
 					  */
   glw_video_surfaces_cleanup(gv);
   hts_mutex_unlock(&gv->gv_surface_mutex);
+
+  if(gv->gv_mp != NULL && gv->gv_mp->mp_player_thread_valid)
+    video_playback_destroy(gv->gv_mp);
+
+  if(vd != NULL && vd->vd_mp != NULL)
+    video_decoder_stop(vd);
 
   video_decoder_destroy(vd);
 

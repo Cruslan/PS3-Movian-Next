@@ -34,6 +34,8 @@
 #include <sys/event_queue.h>
 
 #include <libavutil/avutil.h>
+#include <libavutil/audio_fifo.h>
+#include <libswresample/swresample.h>
 
 #include "main.h"
 #include "media/media.h"
@@ -161,7 +163,7 @@ ps3_audio_reconfig(audio_decoder_t *ad)
    * Open hardware audio port via PSL1GHT v2 libaudio.
    * If requesting an 8-channel surround port fails (e.g. on stereo-only HDMI/AV
    * hardware configurations or stereo emulator backends), gracefully fall back
-   * to 2-channel stereo. The upstream libavresample instance will automatically
+   * to 2-channel stereo. The upstream libswresample instance will automatically
    * perform multi-channel downmixing (5.1/7.1 to stereo) using AltiVec vector SIMD.
    */
   int r = audioPortOpen(&params, &d->port_num);
@@ -222,10 +224,19 @@ ps3_audio_deliver(audio_decoder_t *ad, int samples, int64_t pts, int epoch)
     bi = (current_block + 1) & 7;
 
   while(bi != current_block &&
-	avresample_available(ad->ad_avr) >= AUDIO_BLOCK_SAMPLES) {
+        ad->ad_fifo != NULL &&
+        av_audio_fifo_size(ad->ad_fifo) >= AUDIO_BLOCK_SAMPLES) {
 
     float *dst = buf + d->channels * AUDIO_BLOCK_SAMPLES * bi;
-    uint8_t *planes[8] = {0};
+    void *planes[1] = { (void *)dst };
+
+    /*
+     * Extract exactly AUDIO_BLOCK_SAMPLES (256 frames) of 48 kHz 32-bit float
+     * interleaved PCM from the AVAudioFifo queue directly into the mapped PS3 hardware ring buffer.
+     */
+    int r_samples = av_audio_fifo_read(ad->ad_fifo, planes, AUDIO_BLOCK_SAMPLES);
+    if(r_samples < AUDIO_BLOCK_SAMPLES)
+      break;
 
     float s = audio_master_mute ? 0 : audio_master_volume * ad->ad_vol_scale;
 
@@ -234,9 +245,6 @@ ps3_audio_deliver(audio_decoder_t *ad, int samples, int64_t pts, int epoch)
 
     switch(ad->ad_out_channel_layout) {
     case AV_CH_LAYOUT_STEREO:
-      planes[0] = (uint8_t *)dst;
-      avresample_read(ad->ad_avr, planes, AUDIO_BLOCK_SAMPLES);
-
       for(i = 0; i < AUDIO_BLOCK_SAMPLES / 2; i++) {
 	vec_st(vec_madd(vec_ld(0, dst), m, z), 0, dst);
 	dst += 4;
@@ -244,9 +252,6 @@ ps3_audio_deliver(audio_decoder_t *ad, int samples, int64_t pts, int epoch)
       break;
 
     case AV_CH_LAYOUT_7POINT1:
-      planes[0] = (uint8_t *)dst;
-      avresample_read(ad->ad_avr, planes, AUDIO_BLOCK_SAMPLES);
-
       // Swap Side-channels with Rear-channels as the channel
       // order differs between PS3 and libav
 

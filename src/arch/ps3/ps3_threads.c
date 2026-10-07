@@ -280,8 +280,15 @@ start_thread(const char *name, hts_thread_t *p,
   ti->fn = fn;
   ti->aux = aux;
 
+  /*
+   * Increase PPU thread stack size from legacy 128KB (131072) to 512KB (524288).
+   * Modern FFmpeg 9.0 container demuxers and metadata parsers (MPEG-TS, Matroska,
+   * MP4) utilize deeper recursion and larger local stack frames. A 512KB stack
+   * completely prevents stack overflow (such as 0xd030f070 access violation in
+   * pat_cb during thumbnail generation) while consuming negligible system RAM.
+   */
   s32 r = sys_ppu_thread_create(p, (void *)thread_trampoline, (void *)ti,
-				prio, 131072, flags, (char *)name);
+				prio, 524288, flags, (char *)name);
   if(r) {
     my_trace("Failed to create thread %s: error: 0x%x", name, r);
     exit(0);
@@ -577,17 +584,17 @@ sysLwMutexUnlock(sys_lwmutex_t *mutex)
 }
 
 /* Symbol aliases ensuring both PSL1GHT and newlib internal stub invocations bind natively */
-s32 __sysLwMutexCreate(sys_lwmutex_t *mutex, const sys_lwmutex_attr_t *attr) __attribute__((alias("sysLwMutexCreate")));
-s32 __sysLwMutexDestroy(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexDestroy")));
-s32 __sysLwMutexLock(sys_lwmutex_t *mutex, u64 timeout) __attribute__((alias("sysLwMutexLock")));
-s32 __sysLwMutexTryLock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexTryLock")));
-s32 __sysLwMutexUnlock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexUnlock")));
+s32 __sysLwMutexCreate(sys_lwmutex_t *mutex, const sys_lwmutex_attr_t *attr) __attribute__((alias("sysLwMutexCreate"), used));
+s32 __sysLwMutexDestroy(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexDestroy"), used));
+s32 __sysLwMutexLock(sys_lwmutex_t *mutex, u64 timeout) __attribute__((alias("sysLwMutexLock"), used));
+s32 __sysLwMutexTryLock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexTryLock"), used));
+s32 __sysLwMutexUnlock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexUnlock"), used));
 
-s32 sys_lwmutex_create(sys_lwmutex_t *mutex, const sys_lwmutex_attr_t *attr) __attribute__((alias("sysLwMutexCreate")));
-s32 sys_lwmutex_destroy(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexDestroy")));
-s32 sys_lwmutex_lock(sys_lwmutex_t *mutex, u64 timeout) __attribute__((alias("sysLwMutexLock")));
-s32 sys_lwmutex_trylock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexTryLock")));
-s32 sys_lwmutex_unlock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexUnlock")));
+s32 sys_lwmutex_create(sys_lwmutex_t *mutex, const sys_lwmutex_attr_t *attr) __attribute__((alias("sysLwMutexCreate"), used));
+s32 sys_lwmutex_destroy(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexDestroy"), used));
+s32 sys_lwmutex_lock(sys_lwmutex_t *mutex, u64 timeout) __attribute__((alias("sysLwMutexLock"), used));
+s32 sys_lwmutex_trylock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexTryLock"), used));
+s32 sys_lwmutex_unlock(sys_lwmutex_t *mutex) __attribute__((alias("sysLwMutexUnlock"), used));
 
 
 

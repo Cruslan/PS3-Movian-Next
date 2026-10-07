@@ -107,11 +107,14 @@ static void
 video_seek(AVFormatContext *fctx, media_pipe_t *mp, media_buf_t **mbp,
 	   int64_t pos, const char *txt)
 {
-  pos = FFMAX(0, FFMIN(fctx->duration, pos)) + fctx->start_time;
+  int64_t start_time = (fctx->start_time != AV_NOPTS_VALUE && fctx->start_time != PTS_UNSET) ? fctx->start_time : 0;
+  int64_t duration = (fctx->duration != AV_NOPTS_VALUE && fctx->duration != PTS_UNSET) ? fctx->duration : INT64_MAX;
+
+  pos = FFMAX(0, FFMIN(duration, pos)) + start_time;
 
   TRACE(TRACE_DEBUG, "Video", "seek %s to %.2f (%"PRId64" - %"PRId64")", txt,
-	(pos - fctx->start_time) / 1000000.0,
-	pos, fctx->start_time);
+	(pos - start_time) / 1000000.0,
+	pos, start_time);
 
   if(av_seek_frame(fctx, -1, pos, AVSEEK_FLAG_BACKWARD)) {
     TRACE(TRACE_ERROR, "Video", "Seek failed");
@@ -126,8 +129,7 @@ video_seek(AVFormatContext *fctx, media_pipe_t *mp, media_buf_t **mbp,
     media_buf_free_unlocked(mp, *mbp);
   *mbp = NULL;
 
-  pos -= fctx->start_time;
-
+  pos -= start_time;
 
   prop_set(mp->mp_prop_root, "seektime", PROP_SET_FLOAT, pos / 1000000.0);
 }
@@ -152,6 +154,18 @@ update_seek_index(seek_index_t *si, int sec)
   }
 }
 
+
+
+/**
+ * FFmpeg I/O interrupt callback for media pipeline cancellation.
+ */
+static int
+fa_video_interrupt_cb(void *opaque)
+{
+  media_pipe_t *mp = (media_pipe_t *)opaque;
+  return (mp != NULL && mp->mp_cancellable != NULL) ?
+         cancellable_is_cancelled(mp->mp_cancellable) : 0;
+}
 
 
 /**
@@ -190,11 +204,13 @@ video_player_loop(AVFormatContext *fctx, media_codec_t **cwvec,
   int64_t start = 0;
   if(mp->mp_flags & MP_CAN_SEEK) {
     start = playinfo_get_restartpos(canonical_url, title, resume_mode) * 1000;
-    if(start) {
+    if(start > 0 && (fctx->duration == AV_NOPTS_VALUE || start < fctx->duration - 2000000LL)) {
       TRACE(TRACE_DEBUG, "VIDEO", "Attempting to resume from %.2f seconds",
             start / 1000000.0f);
       mp->mp_seek_base = start;
       video_seek(fctx, mp, &mb, start, "restart position");
+    } else {
+      start = 0;
     }
   }
 
@@ -209,6 +225,11 @@ video_player_loop(AVFormatContext *fctx, media_codec_t **cwvec,
   const int64_t offset = fctx->start_time != PTS_UNSET ? fctx->start_time : 0;
 
   while(1) {
+    if(cancellable_is_cancelled(mp->mp_cancellable)) {
+      e = event_create_type(EVENT_EXIT);
+      break;
+    }
+
     /**
      * Need to fetch a new packet ?
      */
@@ -225,6 +246,10 @@ video_player_loop(AVFormatContext *fctx, media_codec_t **cwvec,
 	continue;
 
       if(r) {
+        if(cancellable_is_cancelled(mp->mp_cancellable) || r == AVERROR_EXIT) {
+          e = event_create_type(EVENT_EXIT);
+          break;
+        }
 	char buf[512];
 	if(av_strerror(r, buf, sizeof(buf)))
 	  snprintf(buf, sizeof(buf), "Error %d", r);
@@ -253,18 +278,19 @@ video_player_loop(AVFormatContext *fctx, media_codec_t **cwvec,
 
         mp->mp_framerate = fctx->streams[si]->avg_frame_rate;
 
-      } else if(fctx->streams[si]->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
+      } else if(fctx->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
 
 	mb = media_buf_from_avpkt_unlocked(mp, &pkt);
 	mb->mb_data_type = MB_AUDIO;
 	mq = &mp->mp_audio;
 
-      } else if(fctx->streams[si]->codec->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+      } else if(fctx->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
 
-	int duration = pkt.convergence_duration ?: pkt.duration;
+	/* Modern FFmpeg consolidates subtitle display intervals directly into pkt.duration */
+	int duration = pkt.duration;
 
 	mb = media_buf_from_avpkt_unlocked(mp, &pkt);
-	mb->mb_codecid = fctx->streams[si]->codec->codec_id;
+	mb->mb_codecid = fctx->streams[si]->codecpar->codec_id;
 	mb->mb_font_context = freetype_context;
 	mb->mb_data_type = MB_SUBTITLE;
 	mq = &mp->mp_video;
@@ -274,7 +300,7 @@ video_player_loop(AVFormatContext *fctx, media_codec_t **cwvec,
       } else {
 	/* Check event queue ? */
       bad:
-	av_free_packet(&pkt);
+	av_packet_unref(&pkt);
 	continue;
       }
 
@@ -309,7 +335,7 @@ video_player_loop(AVFormatContext *fctx, media_codec_t **cwvec,
       }
 
       mb->mb_keyframe = !!(pkt.flags & AV_PKT_FLAG_KEY);
-      av_free_packet(&pkt);
+      av_packet_unref(&pkt);
     }
 
     /*
@@ -361,7 +387,9 @@ video_player_loop(AVFormatContext *fctx, media_codec_t **cwvec,
     } else if(event_is_action(e, ACTION_SKIP_FORWARD) ||
               event_is_action(e, ACTION_SKIP_BACKWARD) ||
               event_is_type(e, EVENT_EXIT) ||
-	      event_is_type(e, EVENT_PLAY_URL)) {
+	      event_is_type(e, EVENT_PLAY_URL) ||
+	      event_is_action(e, ACTION_STOP) ||
+	      event_is_action(e, ACTION_NAV_BACK)) {
       break;
     }
     event_release(e);
@@ -677,6 +705,9 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
     return NULL;
   }
 
+  fctx->interrupt_callback.callback = fa_video_interrupt_cb;
+  fctx->interrupt_callback.opaque = mp;
+
 #if defined(PLATFORM_PS3) || defined(__PPU__) || defined(PS3)
   /**
    * PS3 Hardware Video Codec Pre-Flight Validation:
@@ -700,25 +731,24 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
 
   for(stream_idx = 0; stream_idx < fctx->nb_streams; stream_idx++) {
     AVStream *st = fctx->streams[stream_idx];
-    if(st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+    if(st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
       has_video = 1;
       if(first_video_codec_id == 0)
-        first_video_codec_id = st->codec->codec_id;
+        first_video_codec_id = st->codecpar->codec_id;
 
       /*
-       * Block next-generation computationally prohibitive codecs (HEVC/H.265, VP9, AV1)
-       * that exceed the in-order 2-issue Cell PPE's CPU limits and induce thread starvation.
-       * Also block unrecognized video codecs (such as AV1 containers where codec_id is
-       * AV_CODEC_ID_NONE or no decoder exists in Libav 11).
-       * Standard SD and 720p software codecs (MPEG-4 Part 2 / DivX / XviD, VP8, MJPEG,
-       * Sorenson Spark / FLV1, MPEG-1, DV, WMV) are supported via libavcodec and RSX YUVP rendering.
+       * Allow all codecs supported by FFmpeg (including modern HEVC and AV1).
+       * Explicitly allow AV_CODEC_ID_AV1 even without hardware acceleration.
        */
-      if(st->codec->codec_id == AV_CODEC_ID_HEVC ||
-         st->codec->codec_id == AV_CODEC_ID_VP9 ||
-         st->codec->codec_id == AV_CODEC_ID_NONE ||
-         avcodec_find_decoder(st->codec->codec_id) == NULL) {
+      if(st->codecpar->codec_id == AV_CODEC_ID_AV1) {
+        supported_video = 1;
+        continue;
+      }
+
+      if(st->codecpar->codec_id == AV_CODEC_ID_NONE ||
+         avcodec_find_decoder(st->codecpar->codec_id) == NULL) {
         supported_video = 0;
-        first_video_codec_id = st->codec->codec_id;
+        first_video_codec_id = st->codecpar->codec_id;
         break;
       }
       supported_video = 1;
@@ -825,20 +855,31 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
     char str[256];
     media_codec_params_t mcp = {0};
     AVStream *st = fctx->streams[i];
-    AVCodecContext *ctx = st->codec;
+    AVCodecParameters *par = st->codecpar;
     AVDictionaryEntry *fn, *mt;
+    AVCodecContext *ctx = NULL;
 
-    avcodec_string(str, sizeof(str), ctx, 0);
-    TRACE(TRACE_DEBUG, "Video", " Stream #%d: %s", i, str);
+    const AVCodec *codec = avcodec_find_decoder(par->codec_id);
+    if(codec != NULL) {
+      ctx = avcodec_alloc_context3(codec);
+      if(ctx != NULL) {
+        avcodec_parameters_to_context(ctx, par);
+      }
+    }
 
-    switch(ctx->codec_type) {
+    if(ctx != NULL) {
+      avcodec_string(str, sizeof(str), ctx, 0);
+      TRACE(TRACE_DEBUG, "Video", " Stream #%d: %s", i, str);
+    }
+
+    switch(par->codec_type) {
     case AVMEDIA_TYPE_VIDEO:
       has_video_stream = 1;
-      unsupported_video_codec_id = ctx->codec_id;
-      mcp.width = ctx->width;
-      mcp.height = ctx->height;
-      mcp.profile = ctx->profile;
-      mcp.level = ctx->level;
+      unsupported_video_codec_id = par->codec_id;
+      mcp.width = par->width;
+      mcp.height = par->height;
+      mcp.profile = par->profile;
+      mcp.level = par->level;
       mcp.sar_num = st->sample_aspect_ratio.num;
       mcp.sar_den = st->sample_aspect_ratio.den;
 
@@ -846,16 +887,17 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
       mcp.frame_rate_den = st->avg_frame_rate.den;
 
       if(!mcp.frame_rate_num  || !mcp.frame_rate_num) {
-	mcp.frame_rate_num = ctx->time_base.den;
-	mcp.frame_rate_den = ctx->time_base.num;
+	mcp.frame_rate_num = st->time_base.den;
+	mcp.frame_rate_den = st->time_base.num;
       }
       break;
 
     case AVMEDIA_TYPE_AUDIO:
-      if(va.flags & BACKEND_VIDEO_NO_AUDIO)
+      if(va.flags & BACKEND_VIDEO_NO_AUDIO) {
+        if(ctx != NULL)
+          avcodec_free_context(&ctx);
 	continue;
-      if(ctx->codec_id == AV_CODEC_ID_DTS)
-	ctx->channels = 0;
+      }
       break;
 
     case AVMEDIA_TYPE_ATTACHMENT:
@@ -868,7 +910,7 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
 #if ENABLE_LIBAV_ATTACHMENT_POINTER
             st->attached_size
 #else
-            st->codec->extradata_size
+            par->extradata_size
 #endif
             );
 
@@ -877,12 +919,8 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
 	attachment_load(&alist, url, st->attached_offset, st->attached_size,
 			freetype_context, fn ? fn->value : "<unknown>");
 #else
-      if(st->codec->extradata_size) {
-        buf_t *b = buf_create_and_adopt(st->codec->extradata_size,
-                                        st->codec->extradata,
-                                        (void *)&av_free);
-        st->codec->extradata = NULL;
-        st->codec->extradata_size = 0;
+      if(par->extradata_size) {
+        buf_t *b = buf_create_and_copy(par->extradata_size, par->extradata);
 	attachment_load_buf(&alist, b, freetype_context,
                             fn ? fn->value : "<unknown>");
         buf_release(b);
@@ -896,20 +934,38 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
     }
 
 
-    if(ctx->codec_type == AVMEDIA_TYPE_VIDEO && mp->mp_video.mq_stream != -1)
+    if(par->codec_type == AVMEDIA_TYPE_VIDEO && mp->mp_video.mq_stream != -1) {
+      if(ctx != NULL)
+        avcodec_free_context(&ctx);
       continue;
+    }
 
-    mcp.extradata      = ctx->extradata;
-    mcp.extradata_size = ctx->extradata_size;
+    if(ctx != NULL && ctx->extradata != NULL) {
+      mcp.extradata      = ctx->extradata;
+      mcp.extradata_size = ctx->extradata_size;
+    } else {
+      mcp.extradata      = par->extradata;
+      mcp.extradata_size = par->extradata_size;
+    }
 
-    cwvec[i] = media_codec_create(ctx->codec_id, 0, fw, ctx, &mcp, mp);
+    cwvec[i] = media_codec_create(par->codec_id, 0, fw, ctx, &mcp, mp);
 
     if(cwvec[i] != NULL) {
       TRACE(TRACE_DEBUG, "Video", " Stream #%d: Codec created", i);
-      switch(ctx->codec_type) {
+      switch(par->codec_type) {
       case AVMEDIA_TYPE_VIDEO:
 	if(mp->mp_video.mq_stream == -1) {
 	  mp->mp_video.mq_stream = i;
+          if(par->codec_id == AV_CODEC_ID_AV1 ||
+             par->codec_id == AV_CODEC_ID_HEVC ||
+             par->codec_id == AV_CODEC_ID_VP9 ||
+             par->codec_id == AV_CODEC_ID_VP8) {
+            const char *cname = (par->codec_id == AV_CODEC_ID_HEVC) ? "H265" :
+                                (par->codec_id == AV_CODEC_ID_AV1)  ? "AV1" :
+                                (par->codec_id == AV_CODEC_ID_VP8)  ? "VP8" : "VP9";
+            notify_add(mp->mp_prop_notifications, NOTIFY_WARNING, NULL, 10,
+                       _("Cell-%s: Software decode active (unaccelerated on PS3, they won't work as intended)"), cname);
+          }
           if(mcp.frame_rate_num && mcp.frame_rate_den) {
             htsmsg_add_dbl(vpi, "framerate",
                            (double)mcp.frame_rate_num / mcp.frame_rate_den);
@@ -970,6 +1026,58 @@ be_file_playvideo_fh(const char *url, media_pipe_t *mp,
 
     return NULL;
   }
+
+#if defined(PLATFORM_PS3) || defined(__PPU__) || defined(PS3)
+  /**
+   * Interactive Pre-Playback Confirmation for Unaccelerated Next-Gen Codecs (H.265/HEVC, AV1, VP8, VP9).
+   * Displays an on-screen modal dialog box with [OK] and [Cancel] buttons before
+   * initializing playback queues, warning that the Cell PPE lacks hardware acceleration.
+   * If cancelled, cleanly tears down resources and seamlessly returns to navigation.
+   */
+  if(has_video_stream && mp->mp_video.mq_stream != -1) {
+    int vcodec_id = fctx->streams[mp->mp_video.mq_stream]->codecpar->codec_id;
+    if(vcodec_id == AV_CODEC_ID_HEVC || vcodec_id == AV_CODEC_ID_AV1 ||
+       vcodec_id == AV_CODEC_ID_VP9 || vcodec_id == AV_CODEC_ID_VP8) {
+      const char *cname = (vcodec_id == AV_CODEC_ID_HEVC) ? "H.265 / HEVC" :
+                          (vcodec_id == AV_CODEC_ID_AV1)  ? "AV1" :
+                          (vcodec_id == AV_CODEC_ID_VP8)  ? "VP8" : "VP9";
+      char prompt[512];
+      snprintf(prompt, sizeof(prompt),
+               "Notice: %s format detected.\n\n"
+               "PlayStation 3 lacks hardware video decoding for this codec. "
+               "Software decoding may result in severe stuttering, dropped frames, system lag or even crashing.\n\n"
+               "Do you still want to proceed with playback?",
+               cname);
+
+      if(message_popup(prompt, MESSAGE_POPUP_OK | MESSAGE_POPUP_CANCEL, NULL) != MESSAGE_POPUP_OK) {
+        TRACE(TRACE_INFO, "Video",
+              "User cancelled playback of unaccelerated %s stream in %s",
+              cname, url);
+        if(errbuf && errlen)
+          errbuf[0] = '\0';
+
+        prop_set(mp->mp_prop_root, "loading", PROP_SET_INT, 0);
+        htsmsg_release(vpi);
+
+        for(i = 0; i < cwvec_size; i++)
+          if(cwvec[i] != NULL)
+            media_codec_deref(cwvec[i]);
+
+        attachment_unload_all(&alist);
+        media_format_deref(fw);
+
+        if(ss != NULL)
+          sub_scanner_destroy(ss);
+
+#if ENABLE_METADATA
+        if(md != NULL)
+          metadata_destroy(md);
+#endif
+        return NULL;
+      }
+    }
+  }
+#endif
 
   int flags = MP_CAN_PAUSE;
 

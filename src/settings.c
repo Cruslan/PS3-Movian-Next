@@ -279,8 +279,10 @@ settings_create_info(prop_t *parent, const char *image,
 {
   prop_t *r = setting_add(parent, NULL, "info", 0);
   prop_set(r, "description", PROP_SET_LINK, description);
-  if(image != NULL)
+  if(image != NULL) {
     prop_set(r, "image", PROP_SET_STRING, image);
+    prop_setv(r, "metadata", "icon", NULL, PROP_SET_STRING, image);
+  }
 }
 
 
@@ -1398,8 +1400,19 @@ settings_init(void)
 
   gconf.settings_network =
     settings_add_dir(NULL, _p("Network settings"), "network", NULL,
-                     _p("Network services, etc"),
+                     _p("Legacy network services (Insecure - Avoid Use)"),
                      "settings:network");
+
+  // Prominent security warning banner for insecure legacy network services
+  settings_create_separator(gconf.settings_network,
+                            _p("SECURITY WARNING: INSECURE LEGACY SERVICES"));
+
+  settings_create_info(gconf.settings_network,
+                       "skin://icons/ic_error_48px.svg",
+                       _p("CRITICAL NOTICE: Built-in network services (FTP, SSH, Web Remote Control, BitTorrent) use outdated, unmaintained legacy protocol stacks with known security vulnerabilities. Running these services on modern networks leaves your PlayStation 3 console exposed to remote network exploits and severe security risks. It is STRONGLY ADVISED to keep all network tools DISABLED and avoid using them."));
+
+  settings_create_separator(gconf.settings_network,
+                            _p("General network settings"));
 
   // Add configurable system name
 
@@ -1698,6 +1711,9 @@ setting_get_dir(const char *key)
                                     "settings:tv");
     }
     r = tvsettings;
+  } else if(!strcmp(key, "settings:network") || !strcmp(key, "network")) {
+    /* Expose Network Settings directory for network-related subsystems like BitTorrent */
+    r = gconf.settings_network;
   } else if((k2 = mystrbegins(key, "general:")) != NULL) {
 
     static prop_t *general;

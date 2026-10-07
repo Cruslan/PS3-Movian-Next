@@ -1421,23 +1421,60 @@ typedef struct stppmsg {
 //static service_t *stpp_browser_service;
 
 /**
+ * @brief Constructs and formats an STPP discovery beacon message datagram.
  *
+ * Populates the binary STPP wire-format broadcast datagram with node identity,
+ * system capabilities, device GUID, server port, and node role flags.
+ *
+ * @param[out] msg Pointer to target stppmsg_t packet buffer to populate.
+ * @return 0 on success, -1 if the system name descriptor has not been initialized.
+ *
+ * @complexity O(1) time complexity, O(1) space complexity.
  */
 static int
 build_msg(stppmsg_t *msg)
 {
   extern int http_server_port;
+
+  /* Validate that the system name reference string is available */
   if(stpp_system_name == NULL)
     return -1;
-  strncpy(msg->name, rstr_get(stpp_system_name), sizeof(msg->name));
-  strncpy(msg->type, arch_get_system_type(), sizeof(msg->type));
+
+  /* Safely copy system name with explicit null-termination guarantee */
+  const char *sys_name = rstr_get(stpp_system_name);
+  if(sys_name != NULL) {
+    strncpy(msg->name, sys_name, sizeof(msg->name) - 1);
+    msg->name[sizeof(msg->name) - 1] = '\0';
+  } else {
+    msg->name[0] = '\0';
+  }
+
+  /* Safely copy architecture/system type with explicit null-termination guarantee */
+  const char *sys_type = arch_get_system_type();
+  if(sys_type != NULL) {
+    strncpy(msg->type, sys_type, sizeof(msg->type) - 1);
+    msg->type[sizeof(msg->type) - 1] = '\0';
+  } else {
+    msg->type[0] = '\0';
+  }
+
+  /* Set STPP protocol magic header identifier */
   memcpy(msg->magic, "STPP", 4);
+
+  /* Set device identity binary blob */
   memcpy(msg->deviceid, stpp_id, sizeof(msg->deviceid));
+
+  /* Set protocol revision */
   msg->version = STPP_VERSION;
+
+  /* Write Big-Endian 16-bit HTTP port */
   wr16_be(msg->port, http_server_port);
+
+  /* Compute node role bitmap based on active controller/controllee states */
   msg->role =
     (stpp_controller ? STPP_ROLE_CONTROLLER : 0) |
     (stpp_controllee ? STPP_ROLE_CONTROLLEE : 0);
+
   return 0;
 }
 

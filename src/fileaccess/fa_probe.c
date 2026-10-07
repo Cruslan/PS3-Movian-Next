@@ -58,7 +58,7 @@
 static const char *
 codecname(enum AVCodecID id)
 {
-  AVCodec *c;
+  const AVCodec *c;
 
   switch(id) {
   case AV_CODEC_ID_AC3:
@@ -470,12 +470,13 @@ fa_probe_iso(metadata_t *md, fa_handle_t *fh)
  */
 static void
 fa_lavf_load_meta(metadata_t *md, AVFormatContext *fctx,
-		  const char *filename)
+		  const char *filename, const char *url)
 {
   int i;
   char tmp1[1024];
   int has_video = 0;
   int has_audio = 0;
+  int has_attached_pic = 0;
 
   md->md_artist = libav_metadata_rstr(fctx->metadata, "artist") ?:
     libav_metadata_rstr(fctx->metadata, "author");
@@ -489,14 +490,35 @@ fa_lavf_load_meta(metadata_t *md, AVFormatContext *fctx,
 
   for(i = 0; i < fctx->nb_streams; i++) {
     AVStream *stream = fctx->streams[i];
-    AVCodecContext *avctx = stream->codec;
+    AVCodecParameters *par = stream->codecpar;
 
-    if(avctx->codec_type == AVMEDIA_TYPE_AUDIO)
+    if(par->codec_type == AVMEDIA_TYPE_AUDIO)
       has_audio = 1;
 
-    if(avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
-       !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC))
-      has_video = 1;
+    if(par->codec_type == AVMEDIA_TYPE_VIDEO) {
+      if(stream->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+        has_attached_pic = 1;
+      } else {
+        has_video = 1;
+      }
+    }
+
+    if(par->codec_type == AVMEDIA_TYPE_ATTACHMENT) {
+      AVDictionaryEntry *mt = av_dict_get(stream->metadata, "mimetype", NULL, AV_DICT_IGNORE_SUFFIX);
+      AVDictionaryEntry *fn = av_dict_get(stream->metadata, "filename", NULL, AV_DICT_IGNORE_SUFFIX);
+      if((mt != NULL && (!strcmp(mt->value, "image/jpeg") || !strcmp(mt->value, "image/png"))) ||
+         (fn != NULL && (strstr(fn->value, ".jpg") || strstr(fn->value, ".png") || strstr(fn->value, ".jpeg")))) {
+        has_attached_pic = 1;
+      }
+    }
+  }
+
+  if(has_attached_pic && url != NULL) {
+    char cover_url_buf[URL_MAX];
+    snprintf(cover_url_buf, sizeof(cover_url_buf), "%s#cover", url);
+    rstr_t *cover_url = rstr_alloc(cover_url_buf);
+    rstr_vec_append(&md->md_icons, cover_url);
+    rstr_release(cover_url);
   }
 
   if(has_audio && !has_video) {
@@ -522,16 +544,26 @@ fa_lavf_load_meta(metadata_t *md, AVFormatContext *fctx,
 
     for(i = 0; i < fctx->nb_streams; i++) {
       AVStream *stream = fctx->streams[i];
-      AVCodecContext *avctx = stream->codec;
-      AVCodec *codec = avcodec_find_decoder(avctx->codec_id);
+      AVCodecParameters *par = stream->codecpar;
+      const AVCodec *codec = avcodec_find_decoder(par->codec_id);
+      AVCodecContext *avctx = NULL;
       AVDictionaryEntry *lang, *title;
       int tn;
       char str[256];
 
-      avcodec_string(str, sizeof(str), avctx, 0);
-      TRACE(TRACE_DEBUG, "Probe", " Stream #%d: %s", i, str);
+      if(codec != NULL) {
+        avctx = avcodec_alloc_context3(codec);
+        if(avctx != NULL) {
+          avcodec_parameters_to_context(avctx, par);
+        }
+      }
 
-      switch(avctx->codec_type) {
+      if(avctx != NULL) {
+        avcodec_string(str, sizeof(str), avctx, 0);
+        TRACE(TRACE_DEBUG, "Probe", " Stream #%d: %s", i, str);
+      }
+
+      switch(par->codec_type) {
       case AVMEDIA_TYPE_VIDEO:
 	/* Any video stream marks the container as video, ensuring unsupported video codecs (e.g. AV1) are not treated as audio */
 	has_video = 1;
@@ -546,11 +578,13 @@ fa_lavf_load_meta(metadata_t *md, AVFormatContext *fctx,
 	break;
 
       default:
+        if(avctx != NULL)
+          avcodec_free_context(&avctx);
 	continue;
       }
 
-      if(codec == NULL) {
-	snprintf(tmp1, sizeof(tmp1), "%s", codecname(avctx->codec_id));
+      if(codec == NULL || avctx == NULL) {
+	snprintf(tmp1, sizeof(tmp1), "%s", codecname(par->codec_id));
       } else {
 	metadata_from_libav(tmp1, sizeof(tmp1), codec, avctx);
       }
@@ -561,13 +595,16 @@ fa_lavf_load_meta(metadata_t *md, AVFormatContext *fctx,
       title = av_dict_get(stream->metadata, "title", NULL,
                           AV_DICT_IGNORE_SUFFIX);
 
-      metadata_add_stream(md, codecname(avctx->codec_id),
-			  avctx->codec_type, i,
+      metadata_add_stream(md, codecname(par->codec_id),
+			  par->codec_type, i,
 			  title ? title->value : NULL,
 			  tmp1,
 			  lang ? lang->value : NULL,
 			  stream->disposition,
-			  tn, avctx->channels);
+			  tn, par->ch_layout.nb_channels);
+
+      if(avctx != NULL)
+        avcodec_free_context(&avctx);
     }
 
     md->md_contenttype = CONTENT_FILE;
@@ -651,7 +688,7 @@ fa_probe_metadata(const char *url, char *errbuf, size_t errsize,
     return md;
   }
 
-  int strategy = fa_libav_get_strategy_for_file(fh);
+  int strategy = FA_LIBAV_OPEN_STRATEGY_PROBE;
 
   AVIOContext *avio = fa_libav_reopen(fh, 0);
 
@@ -662,7 +699,7 @@ fa_probe_metadata(const char *url, char *errbuf, size_t errsize,
     return NULL;
   }
 
-  fa_lavf_load_meta(md, fctx, filename);
+  fa_lavf_load_meta(md, fctx, filename, url);
   fa_libav_close_format(fctx, park);
   return md;
 }
@@ -676,7 +713,7 @@ fa_metadata_from_fctx(AVFormatContext *fctx)
 {
   metadata_t *md = metadata_create();
 
-  fa_lavf_load_meta(md, fctx, NULL);
+  fa_lavf_load_meta(md, fctx, NULL, fctx->url);
   return md;
 }
 

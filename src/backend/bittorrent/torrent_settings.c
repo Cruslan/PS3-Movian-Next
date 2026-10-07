@@ -57,12 +57,24 @@ set_torrent_upload_speed(void *opaque, int v)
 }
 
 
+static void
+set_torrent_enabled(void *opaque, int v)
+{
+  btg.btg_enabled = v;
+  if(allow_update && btg.btg_enabled)
+    torrent_diskio_scan(0);
+}
+
 void
 torrent_settings_init(void)
 {
-  prop_t *dir = setting_get_dir("general:filebrowse");
+  /* Relocate BitTorrent settings directly under Network settings */
+  prop_t *dir = gconf.settings_network ?: setting_get_dir("settings:network");
+  settings_create_separator(dir, _p("BitTorrent"));
   prop_t *s = settings_add_dir(dir, _p("BitTorrent"),
-                               NULL, NULL, NULL, "settings:bittorrent");
+                               "network", NULL,
+                               _p("BitTorrent peer-to-peer download settings"),
+                               "settings:bittorrent");
 
   char defpath[1024];
   int freespace = 10;
@@ -73,11 +85,11 @@ torrent_settings_init(void)
 
   snprintf(defpath, sizeof(defpath), "%s/bittorrentcache", gconf.cache_path);
 
-  /* BitTorrent engine disabled by default to prevent unauthorized network traffic */
+  /* BitTorrent engine disabled by default (SETTING_VALUE 0) in Network settings */
   setting_create(SETTING_BOOL, s, SETTINGS_INITIAL_UPDATE,
                  SETTING_TITLE(_p("Enable bittorrent")),
                  SETTING_MUTEX(&bittorrent_mutex),
-                 SETTING_WRITE_BOOL(&btg.btg_enabled),
+                 SETTING_CALLBACK(set_torrent_enabled, NULL),
                  SETTING_VALUE(0),
                  SETTING_STORE("bittorrent", "enable"),
                  NULL);
@@ -126,5 +138,6 @@ torrent_settings_init(void)
   settings_create_info(s, NULL, btg.btg_disk_status);
 
   allow_update = 1;
-  torrent_diskio_scan(0);
+  if(btg.btg_enabled)
+    torrent_diskio_scan(0);
 }

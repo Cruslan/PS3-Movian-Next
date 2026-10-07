@@ -470,7 +470,7 @@ glw_tex_init(glw_root_t *gr)
     TAILQ_INIT(&gr->gr_tex_load_queue[i]);
 
   for(i = 0; i < GLW_TEXTURE_THREADS; i++)
-    spawn_loader(gr, i >= 4, i);
+    spawn_loader(gr, i >= (GLW_TEXTURE_THREADS / 2), i);
 }
 
 

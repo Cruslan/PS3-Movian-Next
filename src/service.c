@@ -555,6 +555,7 @@ discovered_open_url(prop_t *page, const char *url, int sync)
             PROP_SET_LINK, _p("Local network"));
 
   prop_set(model, "type",     PROP_SET_STRING, "directory");
+  prop_set(model, "contents", PROP_SET_STRING, "discovered");
 
   prop_t *nodes = prop_create_r(model, "nodes");
 

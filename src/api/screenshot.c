@@ -120,7 +120,7 @@ screenshot_response(const char *url, const char *errmsg)
 static buf_t *
 screenshot_compress(pixmap_t *pm, int codecid)
 {
-  AVCodec *codec = avcodec_find_encoder(codecid);
+  const AVCodec *codec = avcodec_find_encoder(codecid);
   if(codec == NULL)
     return NULL;
 
@@ -128,22 +128,45 @@ screenshot_compress(pixmap_t *pm, int codecid)
   const int height = pm->pm_height;
 
   AVCodecContext *ctx = avcodec_alloc_context3(codec);
-  ctx->pix_fmt = codec->pix_fmts[0];
+  if(ctx == NULL)
+    return NULL;
+
+  /*
+   * Query supported pixel format configurations for this encoder using modern
+   * FFmpeg avcodec_get_supported_config API. In modern FFmpeg, AVCodec structures
+   * are immutable and opaque, preventing direct access to codec->pix_fmts.
+   * If a valid pixel format list is returned, adopt the primary format;
+   * otherwise fallback safely depending on codec ID.
+   */
+  const enum AVPixelFormat *pix_fmts = NULL;
+  int num_pix_fmts = 0;
+  if(avcodec_get_supported_config(ctx, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0,
+                                  (const void **)&pix_fmts, &num_pix_fmts) >= 0 &&
+     pix_fmts != NULL && pix_fmts[0] != AV_PIX_FMT_NONE) {
+    ctx->pix_fmt = pix_fmts[0];
+  } else {
+    /* Fallback default format: YUVJ420P for MJPEG thumbnails, RGB24 for PNG */
+    ctx->pix_fmt = (codecid == AV_CODEC_ID_MJPEG) ? AV_PIX_FMT_YUVJ420P : AV_PIX_FMT_RGB24;
+  }
   ctx->time_base.den = 1;
   ctx->time_base.num = 1;
   ctx->sample_aspect_ratio.num = 1;
   ctx->sample_aspect_ratio.den = 1;
   ctx->width  = width;
   ctx->height = height;
+  ctx->thread_count = 1;
 
   if(avcodec_open2(ctx, codec, NULL) < 0) {
     TRACE(TRACE_ERROR, "ScreenShot", "Unable to open image encoder");
+    avcodec_free_context(&ctx);
     return NULL;
   }
 
   AVFrame *oframe = av_frame_alloc();
-
-  avpicture_alloc((AVPicture *)oframe, ctx->pix_fmt, width, height);
+  oframe->format = ctx->pix_fmt;
+  oframe->width  = width;
+  oframe->height = height;
+  av_frame_get_buffer(oframe, 32);
 
   const uint8_t *ptr[4] = {};
   int strides[4] = {0};
@@ -157,28 +180,35 @@ screenshot_compress(pixmap_t *pm, int codecid)
   }
   struct SwsContext *sws;
   sws = sws_getContext(width, height, AV_PIX_FMT_RGB32,
-                       width, height, ctx->pix_fmt, SWS_BILINEAR,
+                       width, height, ctx->pix_fmt,
+                       SWS_FAST_BILINEAR | SWS_ACCURATE_RND,
                        NULL, NULL, NULL);
+  if(sws == NULL) {
+    sws = sws_getContext(width, height, AV_PIX_FMT_RGB32,
+                         width, height, ctx->pix_fmt, SWS_BILINEAR,
+                         NULL, NULL, NULL);
+  }
 
   sws_scale(sws, ptr, strides,
             0, height, &oframe->data[0], &oframe->linesize[0]);
   sws_freeContext(sws);
 
   oframe->pts = AV_NOPTS_VALUE;
-  AVPacket out;
-  memset(&out, 0, sizeof(AVPacket));
-  int got_packet;
-  int r = avcodec_encode_video2(ctx, &out, oframe, &got_packet);
-  buf_t *b;
-  if(r >= 0 && got_packet) {
-    b = buf_create_and_adopt(out.size, out.data, &av_free);
-  } else {
-    assert(out.data == NULL);
-    b = NULL;
+
+  AVPacket *out = av_packet_alloc();
+  buf_t *b = NULL;
+
+  int r = avcodec_send_frame(ctx, oframe);
+  if(r >= 0) {
+    r = avcodec_receive_packet(ctx, out);
+    if(r >= 0 && out->size > 0) {
+      b = buf_create_and_copy(out->size, out->data);
+    }
   }
+
+  av_packet_free(&out);
   av_frame_free(&oframe);
-  avcodec_close(ctx);
-  av_free(ctx);
+  avcodec_free_context(&ctx);
   return b;
 }
 

@@ -34,7 +34,6 @@
       TRACE(TRACE_DEBUG, "Indexer", x, ##__VA_ARGS__);               \
   } while(0)
 
-extern int media_buffer_hungry;
 
 static void
 update_item(void *db, const fa_dir_entry_t *fsentry, const char *parent,

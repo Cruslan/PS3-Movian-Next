@@ -47,6 +47,7 @@
  * and memory management for the PlayStation 3 Cell Broadband Engine & RSX NV47 GPU.
  */
 #include <ppu-lv2.h>
+#include <ppu-asm.h>
 #include <rsx/gcm_sys.h>
 #include <rsx/rsx.h>
 #include <rsx/commands.h>
@@ -127,8 +128,6 @@ static hts_mutex_t rsx_mempool_lock;
 static void clear_btns(void);
 
 static u32 *rsx_initial_cmd_buffer = NULL;
-static u32 rsx_cmd_buffer_words = 0;
-static int first_fb = 1;
 
 #define GCM_LABEL_INDEX 255
 static u32 sLabelVal = 1;
@@ -212,119 +211,77 @@ waitRSXIdle(gcmContextData *context)
  * - Space Complexity: O(1) stack allocation.
  */
 static void
-waitFlip()
+waitFlip(void)
 {
   int i = 0;
+  /* Poll until hardware display scanout swap is acknowledged by GameOS LV1 (0 = flip completed) */
   while(gcmGetFlipStatus() != 0) {
     i++;
     usleep(200);
-    if(i == 10000) {
-      TRACE(TRACE_ERROR, "GLW", "Flip never happend, system reboot");
-      Lv2Syscall3(379, 0x1200, 0, 0 );
-      gcmResetFlipStatus();
+    if(unlikely(i == 5000)) {
+      /* Timeout reached (1.0s) - capture control registers for diagnostic inspection */
+      gcmControlRegister volatile *ctrl = gcmGetControlRegister();
+      TRACE(TRACE_ERROR, "GLW", "Flip wait timeout reached (1.0s) [GET=0x%x PUT=0x%x status=%u]",
+            ctrl ? ctrl->get : 0, ctrl ? ctrl->put : 0, gcmGetFlipStatus());
+      static int s_dumped = 0;
+      if(!s_dumped && ctrl && glwps3 && glwps3->gr.gr_be.be_ctx) {
+        s_dumped = 1;
+        extern void rsx_dump_recent_jobs(void);
+        rsx_dump_recent_jobs();
+        u32 get_off = ctrl->get;
+        if(get_off < 4 * 1024 * 1024 - 0x80) {
+          const u32 *base = glwps3->gr.gr_be.be_ctx->begin;
+          u32 start_word = (get_off >= 0x180) ? ((get_off - 0x180) & ~0xf) / 4 : 0;
+          u32 end_word = ((get_off + 0x80) & ~0xf) / 4;
+          TRACE(TRACE_ERROR, "GLW_DUMP", "=== RSX CMD DUMP around GET=0x%x (begin=%p) ===", get_off, base);
+          for(u32 w = start_word; w < end_word; w += 4) {
+            TRACE(TRACE_ERROR, "GLW_DUMP", "  [0x%05x]: 0x%08x 0x%08x 0x%08x 0x%08x",
+                  w * 4, base[w], base[w+1], base[w+2], base[w+3]);
+          }
+        } else {
+          TRACE(TRACE_ERROR, "GLW_DUMP", "RSX GET=0x%x is out of command buffer bounds (hardware lockup)", get_off);
+        }
+      }
+      return;
     }
   }
-  gcmResetFlipStatus();
+
+  /* Reset flip status register ONLY when flip is successfully completed */
+  if(gcmGetFlipStatus() == 0)
+    gcmResetFlipStatus();
 }
 
 /**
- * @brief Reset the RSX command buffer to the initial post-setup address every frame.
+ * @brief Enqueues hardware display buffer flip and flushes RSX FIFO.
  *
- * Implements the canonical command buffer ring-buffer reset documented by RPCS3 lead RSX
- * developer kd-11 in ps3gl (source/rsxutil.c):
- * 1. Emits rsxFinish(ctx, 1) command marker into the active stream.
- * 2. Emits an NV40 hardware JUMP opcode pointing directly to rsx_initial_cmd_buffer offset.
- * 3. Enforces a PowerPC architecture memory barrier (__asm__ volatile("sync" ::: "memory"))
- *    guaranteeing that the JUMP opcode is committed to physical RAM before modifying control registers.
- * 4. Updates the hardware PUT control register (ctrl->put = startoffs). Because the RSX GET pointer
- *    is currently at the tail of the buffer (GET != PUT), the RSX FIFO fetches and executes through
- *    the JUMP instruction, branching GET to startoffs. At startoffs, GET == PUT, causing the RSX
- *    command processor to cleanly halt in an idle state without fetching stale data.
- * 5. PPU spins on ctrl->get with usleep yielding until the RSX processor arrives at startoffs.
- * 6. Resets GCM context cursors (current, begin, end) back to rsx_initial_cmd_buffer.
+ * Submits gcmSetFlip for the backbuffer that was just rasterized and flushes
+ * the command buffer to the RSX hardware FIFO immediately via rsxFlushBuffer.
  *
- * @param gp Pointer to PS3 UI state context.
+ * Architectural Invariant:
+ * - VSYNC synchronization is managed on the host PPU side via waitFlip() at the start
+ *   of each frame in glw_ps3_mainloop(). Polling gcmGetFlipStatus() guarantees that the
+ *   previous frame has completed hardware scanout before rendering into that buffer begins.
+ *   Omitting GPU-side gcmSetWaitFlip eliminates race conditions and FIFO deadlocks where
+ *   RSX stalls waiting on a flip semaphore that the PPU has already retired.
+ *
+ * @param gp Pointer to active PS3 UI context state.
+ * @param buffer Double-buffering index (0 or 1) to be flipped to active display scanout.
  *
  * Complexity:
- * - Time Complexity: O(1) bounded hardware register polling.
+ * - Time Complexity: O(1) command emission into ring buffer.
  * - Space Complexity: O(1) stack allocation.
- */
-static void
-resetCommandBuffer(glw_ps3_t *gp)
-{
-  gcmContextData *ctx = gp->gr.gr_be.be_ctx;
-  u32 startoffs = 0;
-
-  rsxFinish(ctx, 1);
-
-  if(unlikely(rsxAddressToOffset(rsx_initial_cmd_buffer, &startoffs) != 0))
-    return;
-
-  rsxSetJumpCommand(ctx, startoffs);
-  __asm__ volatile("sync" ::: "memory");
-
-  gcmControlRegister volatile *ctrl = gcmGetControlRegister();
-  ctrl->put = startoffs;
-
-  uint32_t spins = 0;
-  while(ctrl->get != startoffs && spins < 100000) {
-    usleep(30);
-    spins++;
-  }
-
-  ctx->current = rsx_initial_cmd_buffer;
-  ctx->begin   = rsx_initial_cmd_buffer;
-  ctx->end     = rsx_initial_cmd_buffer + rsx_cmd_buffer_words;
-}
-
-/**
- * @brief Queue hardware display buffer flip, enforce VSYNC synchronization,
- * and execute seamless command buffer ring-buffer reset at each frame boundary.
- *
- * Implements canonical frame-boundary display synchronization and command buffer resetting:
- * 1. Drains pending RSX commands for the current frame via waitFinish(ctx).
- * 2. Synchronizes with hardware VSYNC scanout swap via waitFlip().
- * 3. Enqueues display flip for the current backbuffer via gcmSetFlip(ctx, buffer) and flushes FIFO.
- * 4. Writes gcmSetWaitFlip(ctx) so RSX rasterizer waits for upcoming display scanout before rendering.
- * 5. Calls resetCommandBuffer(gp) to return the 4MB buffer back to rsx_initial_cmd_buffer every single frame.
- *
- * @param gp Pointer to PS3 UI state context.
- * @param buffer Double-buffering index (0 or 1) to be flipped to the display scanout.
- *
- * Time Complexity: O(1) command emission and bounded register synchronization.
- * Space Complexity: O(1) stack allocation.
  */
 static void
 flip(glw_ps3_t *gp, s32 buffer) 
 {
   gcmContextData *ctx = gp->gr.gr_be.be_ctx;
 
-  /* 1. Flush active rendering commands and ensure RSX finishes execution for this frame */
-  waitFinish(ctx);
 
-  /* 2. Synchronize with display VSYNC scanout */
-  if(!first_fb)
-    waitFlip();
-  else {
-    gcmResetFlipStatus();
-    first_fb = 0;
-  }
 
-  /* Log initial frames and periodic milestones for runtime verification */
-  static int flip_count = 0;
-  if(flip_count++ < 5 || (flip_count % 300) == 0) {
-    TRACE(TRACE_DEBUG, "GLW", "flip #%d on buffer %d", flip_count, buffer);
-  }
-
-  /* 3. Dispatch hardware flip for the backbuffer we just finished rendering */
+  /* Dispatch hardware flip for the backbuffer we just finished rendering and flush immediately */
   gcmSetFlip(ctx, buffer);
   rsxFlushBuffer(ctx);
-
-  /* 4. Enqueue VSYNC wait-flip marker for the next frame */
   gcmSetWaitFlip(ctx);
-
-  /* 5. Reset command buffer back to rsx_initial_cmd_buffer every single frame */
-  resetCommandBuffer(gp);
 }
 
 
@@ -390,38 +347,6 @@ rsx_read_pixels(glw_root_t *gr)
 }
 
 
-/**
- * @brief Defensive hardware GCM Context callback executed on command buffer boundary exhaustion.
- *
- * Invoked by librsx when immediate-mode drawing commands exceed context->end.
- * In PSL1GHT v2 rsx_function_macros.h:
- *   #define RSX_CONTEXT_CURRENT_BEGIN(count) do { \
- *     if((context->current + (count)) > context->end) { \
- *       if(rsxContextCallback(context,(count))!=0) return; \
- *     } \
- *   } while(0)
- *
- * If this callback returns 0, execution does NOT abort and writing continues directly past
- * context->end, causing memory corruption of adjacent font glyph and texture pools.
- * Returning -1 forces rsxContextCallback to return -1, causing the calling routine
- * (e.g. rsxDrawVertex4f or glw_rsx_set_vp_constant_4f) to immediately abort and return,
- * establishing a hard hardware barrier against memory corruption.
- *
- * @param context Pointer to active GCM context descriptor.
- * @param count Number of 32-bit command words requested by the caller.
- * @return s32 -1 to abort command emission and prevent writing past context->end.
- *
- * Complexity:
- * - Time Complexity: O(1) error logging.
- * - Space Complexity: O(1) stack allocation.
- */
-static s32
-movian_rsx_cb(gcmContextData *context, u32 count)
-{
-  TRACE(TRACE_ERROR, "RSX", "Command buffer overflow intercepted and prevented (count=%u current=%p end=%p)\n",
-        (unsigned int)count, context->current, context->end);
-  return -1;
-}
 
 /**
  *
@@ -450,37 +375,16 @@ init_screen(glw_ps3_t *gp)
   s32 r_rsx = rsxInit(&gp->gr.gr_be.be_ctx, 4 * 1024 * 1024, 8 * 1024 * 1024, host_addr); 
   assert(r_rsx == 0);
   assert(gp->gr.gr_be.be_ctx != NULL);
-  
+
   /* Synchronize RSX hardware FIFO so all initial configuration commands from rsxInit are flushed and processed */
   waitRSXIdle(gp->gr.gr_be.be_ctx);
 
-  /* Register robust hardware ring-buffer wrap callback */
-  rsxSetUserCallback(movian_rsx_cb);
-  gp->gr.gr_be.be_ctx->callback = movian_rsx_cb;
-
   /**
-   * Save initial post-initialization command buffer pointer.
-   * rsxInit executes initial hardware register configuration between offset 0x1000 and 0x13a0.
-   * Subsequent rendering frames must reset back to this initial cursor rather than 0x1000,
-   * avoiding accidental corruption of hardware device objects or flip queues.
+   * Save initial post-initialization command buffer pointer for diagnostic tracking.
+   * Context bounds (begin, current, end) are cleanly managed by PSL1GHT librsx.
    */
   rsx_initial_cmd_buffer = gp->gr.gr_be.be_ctx->current;
-  u32 initial_offset = 0;
-  rsxAddressToOffset(rsx_initial_cmd_buffer, &initial_offset);
 
-  u32 total_cb_bytes = 4 * 1024 * 1024;
-  u32 used_init_bytes = (initial_offset >= 4096) ? (initial_offset - 4096) : 0;
-  u32 available_bytes = (total_cb_bytes > used_init_bytes + 4096) ? (total_cb_bytes - used_init_bytes - 4096) : (total_cb_bytes / 2);
-  rsx_cmd_buffer_words = available_bytes / sizeof(u32);
-
-  gp->gr.gr_be.be_ctx->begin = rsx_initial_cmd_buffer;
-  gp->gr.gr_be.be_ctx->current = rsx_initial_cmd_buffer;
-  gp->gr.gr_be.be_ctx->end = rsx_initial_cmd_buffer + rsx_cmd_buffer_words;
-
-  TRACE(TRACE_DEBUG, "RSX", "Command buffer bounds: begin=%p current=%p end=%p span=%ld bytes (init_offset=0x%x)\n",
-        gp->gr.gr_be.be_ctx->begin, gp->gr.gr_be.be_ctx->current, gp->gr.gr_be.be_ctx->end,
-        (long)((char*)gp->gr.gr_be.be_ctx->end - (char*)gp->gr.gr_be.be_ctx->begin), (unsigned int)initial_offset);
-  
   gcmConfiguration config;
   gcmGetConfiguration(&config);
 
@@ -490,8 +394,6 @@ init_screen(glw_ps3_t *gp)
   hts_mutex_init(&rsx_mempool_lock);
   rsx_mempool = extent_create(0, config.localSize >> 4);
   rsx_address = config.localAddress;
-
-
 
   VideoState state;
   videoGetState(0, 0, &state);
@@ -518,8 +420,9 @@ init_screen(glw_ps3_t *gp)
 	gp->res.width, gp->res.height, state.displayMode.aspect, gp->scale);
 
 
-  gp->framebuffer_pitch = 4 * gp->res.width; // each pixel is 4 bytes
-  gp->depthbuffer_pitch = 4 * gp->res.width; // 4 bytes per pixel for Z24S8 (24-bit depth + 8-bit stencil)
+  /* Enforce strict 64-byte pitch alignment required by NV40/G70 scanout & render surfaces */
+  gp->framebuffer_pitch = (4 * gp->res.width + 63) & ~63;
+  gp->depthbuffer_pitch = (2 * gp->res.width + 63) & ~63;
   
   // Configure the buffer format to xRGB
   VideoConfiguration vconfig;
@@ -529,8 +432,21 @@ init_screen(glw_ps3_t *gp)
   vconfig.pitch = gp->framebuffer_pitch;
   vconfig.aspect = state.displayMode.aspect;
 
+  /* Configure video output with non-blocking mode = 0 standard across all PSL1GHT homebrew */
   videoConfigure(0, &vconfig, NULL, 0);
   videoGetState(0, 0, &state);
+
+  /* Drain asynchronous VIDEO_STATE_BUSY state while pumping GameOS events */
+  int busy_spins = 0;
+  while(state.state == VIDEO_STATE_BUSY && busy_spins < 1000) {
+    usleep(1000);
+    sysUtilCheckCallback();
+    videoGetState(0, 0, &state);
+    busy_spins++;
+  }
+
+  /* Synchronize RSX hardware FIFO so video reconfiguration and initial commands are processed */
+  waitRSXIdle(gp->gr.gr_be.be_ctx);
   
   const s32 buffer_size = gp->framebuffer_pitch * gp->res.height; 
   const s32 depth_buffer_size = gp->depthbuffer_pitch * gp->res.height;
@@ -543,17 +459,28 @@ init_screen(glw_ps3_t *gp)
   gp->framebuffer[0] = rsx_alloc(buffer_size, 64);
   gp->framebuffer[1] = rsx_alloc(buffer_size, 64);
 
+  /* Zero both framebuffers in physical GDDR3 VRAM to eliminate power-on scanout noise */
+  memset(rsx_to_ppu(gp->framebuffer[0]), 0, buffer_size);
+  memset(rsx_to_ppu(gp->framebuffer[1]), 0, buffer_size);
+
   TRACE(TRACE_DEBUG, "RSX", "Buffers at 0x%x 0x%x\n",
 	gp->framebuffer[0], gp->framebuffer[1]);
 
-  /* Allocate depth buffer with 4 bytes per pixel for Z24S8 */
+  /* Allocate depth buffer with 2 bytes per pixel for Z16 */
   gp->depthbuffer = rsx_alloc(depth_buffer_size, 64);
   
   // Setup the display buffers
-  gcmSetDisplayBuffer(0, gp->framebuffer[0],
+  int r0 = gcmSetDisplayBuffer(0, gp->framebuffer[0],
 		      gp->framebuffer_pitch, gp->res.width, gp->res.height);
-  gcmSetDisplayBuffer(1, gp->framebuffer[1],
+  int r1 = gcmSetDisplayBuffer(1, gp->framebuffer[1],
 		      gp->framebuffer_pitch, gp->res.width, gp->res.height);
+  if(r0 != 0 || r1 != 0) {
+    TRACE(TRACE_ERROR, "RSX", "gcmSetDisplayBuffer failed: r0=%d r1=%d", r0, r1);
+  }
+
+  /* Reset flip status register and prime the display pipeline with initial flip to buffer 1 */
+  gcmResetFlipStatus();
+  flip(gp, 1);
 
   gp->gr.gr_br_read_pixels = rsx_read_pixels;
 }
@@ -797,8 +724,8 @@ setupRenderTarget(glw_ps3_t *gp, u32 currentBuffer)
   sf.colorPitch[2] = 64;
   sf.colorPitch[3] = 64;
 
-  /* Depth buffer: 24-bit depth / 8-bit stencil format (Z24S8 matching 4 bytes/pixel depthbuffer_pitch) */
-  sf.depthFormat = GCM_SURFACE_ZETA_Z24S8;
+  /* Depth buffer: 16-bit depth format (Z16 matching 2 bytes/pixel depthbuffer_pitch) */
+  sf.depthFormat = GCM_SURFACE_ZETA_Z16;
   sf.depthLocation = GCM_LOCATION_RSX;
   sf.depthOffset = gp->depthbuffer;
   sf.depthPitch = gp->depthbuffer_pitch;
@@ -840,18 +767,26 @@ drawFrame(glw_ps3_t *gp, int buffer, int with_universe)
   /* First bind the render target surface to establish surface dimensions and pixel formats */
   setupRenderTarget(gp, buffer);
 
-  /* Diagnostic trace verifying continuous active rasterization */
-  static int frame_count = 0;
-  if(frame_count++ < 5 || (frame_count % 300) == 0) {
-    TRACE(TRACE_DEBUG, "GLW", "drawFrame #%d on buffer %d (with_universe=%d)",
-          frame_count, buffer, with_universe);
-  }
 
-  /* Setup viewport scale and translation vectors */
+
+  /* Setup viewport scale and translation vectors.
+   * Matching original working Movian configuration:
+   * scale = (width * 0.5f, -height * 0.5f, 1.0f, 0.0f)
+   * offset = (width * 0.5f, height * 0.5f, 0.0f, 0.0f) */
   f32 scale[4] = { gp->res.width * 0.5f, -gp->res.height * 0.5f, 1.0f, 0.0f };
   f32 offset[4] = { gp->res.width * 0.5f, gp->res.height * 0.5f, 0.0f, 0.0f };
   rsxSetViewport(ctx, 0, 0, gp->res.width, gp->res.height, 0.0f, 1.0f, scale, offset);
-  rsxSetViewportClip(ctx, 0, gp->res.width, gp->res.height);
+
+  /* Configure hardware scissor box to full display resolution */
+  rsxSetScissor(ctx, 0, 0, gp->res.width, gp->res.height);
+
+  /* Initialize all 8 hardware viewport clip registers across the entire display resolution */
+  for(int i = 0; i < 8; i++) {
+    rsxSetViewportClip(ctx, (u8)i, gp->res.width, gp->res.height);
+  }
+
+  /* Invalidate RSX texture cache at frame start to guarantee updated glyphs and UI textures are fresh */
+  rsxInvalidateTextureCache(ctx, GCM_INVALIDATE_TEXTURE);
 
   /* Disable near/far clipping plane rejection and enable Z clamping.
    * Movian's 2D perspective matrix positions layout elements at negative Z depths.
@@ -864,12 +799,12 @@ drawFrame(glw_ps3_t *gp, int buffer, int with_universe)
   rsxSetBlendEquation(ctx, GCM_FUNC_ADD, GCM_FUNC_ADD);
   rsxSetBlendEnable(ctx, 1);
 
-  /* Set clear color to solid black and clear depth-stencil buffer (24-bit depth 0xffffff, 8-bit stencil 0x00) */
+  /* Set clear color to solid black and clear 16-bit depth buffer (0xffff) */
   rsxSetClearColor(ctx, 0x00000000);
-  rsxSetClearDepthStencil(ctx, 0xffffff00);
+  rsxSetClearDepthStencil(ctx, 0xffff);
 
-  /* Issue clear command for RGBA, Z depth, and stencil buffers */
-  rsxClearSurface(ctx, GCM_CLEAR_R | GCM_CLEAR_G | GCM_CLEAR_B | GCM_CLEAR_A | GCM_CLEAR_Z | GCM_CLEAR_S);
+  /* Issue clear command for RGBA and Z depth buffers */
+  rsxClearSurface(ctx, GCM_CLEAR_R | GCM_CLEAR_G | GCM_CLEAR_B | GCM_CLEAR_A | GCM_CLEAR_Z);
 
   /* Reset cached shader pointers in case XMB overlay altered GPU registers */
   gp->gr.gr_be.be_vp_current = NULL;
@@ -899,6 +834,7 @@ drawFrame(glw_ps3_t *gp, int buffer, int with_universe)
   glw_render0(gp->gr.gr_universe, &rc);
   glw_unlock(&gp->gr);
   glw_post_scene(&gp->gr);
+
 }
 
 
@@ -1386,17 +1322,16 @@ handle_kb(glw_ps3_t *gp)
 /**
  * @brief Core render, input dispatch, and event pump loop for PS3 user interface.
  *
- * Implements non-blocking first-frame flip status priming followed by double-buffered
- * frame rasterization and VSYNC pacing. Coordinates Sixaxis/DS3 controller polling,
- * USB keyboard input dispatch, and PSL1GHT v2 system utility callback processing.
+ * Implements double-buffered frame rasterization and VSYNC pacing. Coordinates
+ * Sixaxis/DS3 controller polling, USB keyboard input dispatch, and PSL1GHT v2
+ * system utility callback processing.
  *
  * @param gp Pointer to active PS3 UI context state.
  *
  * Algorithmic & Timing Invariants:
- * - On the first frame (first_fb == 1), gcmResetFlipStatus() primes the display register
- *   without blocking in waitFlip(), allowing drawFrame() to queue the initial rasterization commands.
- * - On subsequent frames (first_fb == 0), waitFlip() ensures hardware VSYNC display scanout
- *   synchronization before next frame rasterization begins.
+ * - waitFlip() ensures hardware VSYNC display scanout synchronization before
+ *   the next frame's rasterization commands are emitted into the backbuffer.
+ * - Double-buffering ping-pongs between framebuffer[0] and framebuffer[1].
  *
  * Complexity:
  * - Time Complexity: O(F * N) where F is the number of rendered frames and N is widget tree size.
@@ -1405,11 +1340,19 @@ handle_kb(glw_ps3_t *gp)
 static void
 glw_ps3_mainloop(glw_ps3_t *gp)
 {
+  /**
+   * Deterministic Backbuffer Double-Buffering Sequencing:
+   * Buffer 0 is the active scanout buffer from boot (configured via gcmSetDisplayBuffer).
+   * Frame 1 targets Buffer 1 (the off-screen backbuffer) and executes a real hardware swap (0 -> 1).
+   * Guarded by !first_frame, Frame 1 primes the flip status register via gcmResetFlipStatus() without
+   * blocking. Every subsequent frame waits for the previous flip to complete before drawing.
+   * Frame sequence:
+   *   Frame 1: gcmResetFlipStatus() -> drawFrame(buffer 1) -> flip(buffer 1)
+   *   Frame 2: waitFlip() (waits for buffer 1) -> drawFrame(buffer 0) -> flip(buffer 0)
+   *   Frame 3: waitFlip() (waits for buffer 0) -> drawFrame(buffer 1) -> flip(buffer 1)
+   */
   int currentBuffer = 0;
   TRACE(TRACE_DEBUG, "GLW", "Entering mainloop");
-
-  /* Reset first-frame guard flag to ensure proper initial flip initialization */
-  first_fb = 1;
 
   /* Register PSL1GHT v2 system utility callback */
   sysUtilRegisterCallback(SYSUTIL_EVENT_SLOT0, eventHandle, gp);
@@ -1421,17 +1364,32 @@ glw_ps3_mainloop(glw_ps3_t *gp)
     handle_pads(gp);
     handle_kb(gp);
 
-    /* Render and flip single frame; flip() handles VSYNC synchronization and command buffer reset */
+    /* 1. Synchronize with display VSYNC */
+    waitFlip();
+
+    /* 2. Ensure sufficient command buffer space before rendering the frame.
+     * If remaining headroom is less than 0x4000 words (64KB), invoke the
+     * GameOS context callback to wrap cleanly at the frame boundary. */
+    if((gp->gr.gr_be.be_ctx->current + 0x4000) > gp->gr.gr_be.be_ctx->end) {
+      extern s32 rsxContextCallback(gcmContextData *context, u32 count);
+      rsxContextCallback(gp->gr.gr_be.be_ctx, 0x4000);
+    }
+
+    /* 3. Render UI into verified off-screen backbuffer */
     drawFrame(gp, currentBuffer, 1);
+
+    /* 3. Dispatch hardware flip to scanout and flush RSX FIFO */
     flip(gp, currentBuffer);
+
     currentBuffer = !currentBuffer;
     sysUtilCheckCallback();
   }
 
   /* Render final blank frame on shutdown */
+  waitFlip();
   drawFrame(gp, currentBuffer, 0);
   flip(gp, currentBuffer);
-  currentBuffer = !currentBuffer;
+  waitFlip();
 
   /* Unregister callback before teardown */
   sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT0);

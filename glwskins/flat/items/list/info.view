@@ -2,13 +2,16 @@ widget(container_x, {
   style: "ListItem";
 
   widget(icon, {
-    source: $self.metadata.icon;
+    autohide: true;
+    source: $self.metadata.icon ?? $self.image;
     style: "ListItemIcon";
+    color: [1.0, 0.35, 0.35];
   });
 
   widget(label, {
     filterConstraintX: true;
     caption: $self.description;
-    maxlines: 10;
+    maxlines: 16;
+    color: 0.95;
   });
 });

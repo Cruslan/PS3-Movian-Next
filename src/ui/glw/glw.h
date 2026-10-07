@@ -885,7 +885,10 @@ typedef struct glw_root {
    * Image/Texture loader
    */
   int gr_tex_threads_running;
-#define GLW_TEXTURE_THREADS 6
+  /**
+   * 2 texture loader threads: 1 for foreground UI elements and 1 for background thumbnails/covers
+   */
+#define GLW_TEXTURE_THREADS 2
   hts_thread_t gr_tex_threads[GLW_TEXTURE_THREADS];
 
   LIST_HEAD(,  glw_image) gr_icons;

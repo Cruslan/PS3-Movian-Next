@@ -1,0 +1,110 @@
+#import "skin://theme.view"
+#import "skin://styles/style_list.view"
+
+$view.rightPaneExpansion = scurve($view.showRightPane, 0.3);
+
+widget(container_z, {
+
+  widget(container_x, {
+
+    widget(container_z, {
+      filterConstraintX: true;
+      widget(list_y, {
+        id: "scrollable";
+        navWrap: true;
+        chaseFocus: true;
+
+        clipOffsetTop: 3em;
+        scrollThresholdTop: 4em;
+
+        scrollThresholdBottom: $ui.universeBottomHeight + 2em;
+        clipOffsetBottom: $ui.universeBottomHeight;
+        clipAlpha: 0.2;
+        clipBlur: 1;
+
+        cloner($self.model.nodes, loader, {
+          onEvent(copy, deliverRef($core.clipboard.setFromItem, $self));
+          selectOnFocus: true;
+          selectOnHover: true;
+          time: 0.1;
+          effect: blend;
+          noInitialTransform: true;
+          alt: "skin://items/list/default.view";
+          source: "skin://items/list/" + $self.type + ".view";
+        });
+      });
+
+      ScrollBar("scrollable", 3em, $ui.universeBottomHeight);
+    });
+
+    widget(expander_x, {
+      expansion: iir(delay(select($view.expanded, 1.0, 0.0), 0.1, 1.0), 4);
+      alwaysLayout: true;
+      widget(deck, {
+        width: $ui.width / 2;
+
+        effect: slideVertical;
+        time: 0.4;
+        noInitialTransform: true;
+
+        keepPreviousActive: true;
+        keepNextActive: true;
+        preloadedAreVisible: true;
+
+        cloner($self.model.nodes, loader, {
+          time: 0.1;
+          effect: blend;
+          noInitialTransform: true;
+          source: select(isVisible(),
+                         "skin://items/details/" + $self.type + ".view",
+                         void);
+          alt: "skin://items/details/nothing.view";
+        });
+      });
+    });
+  });
+
+  // Informational empty state when no network devices are broadcasting
+  widget(container_y, {
+    hidden: count($self.model.nodes) > 0;
+    space(1);
+
+    widget(container_y, {
+      align: center;
+      width: select($ui.aspect > 1, $ui.width * 0.65, $ui.width - 4em);
+      spacing: 1.2em;
+
+      widget(icon, {
+        align: center;
+        size: 4em;
+        source: "skin://icons/ic_settings_ethernet_48px.svg";
+        alpha: 0.35;
+      });
+
+      widget(label, {
+        align: center;
+        caption: _("No Local Network Devices Found");
+        size: 1.6em;
+        font: "skin://fonts/RobotoCondensed-Bold.ttf";
+        shadow: true;
+      });
+
+      widget(label, {
+        filterConstraintX: true;
+        align: center;
+        size: 1.1em;
+        color: 0.8;
+        shadow: true;
+        maxlines: 8;
+        caption: _("Local Network scans for UPnP / DLNA media servers and SMB / Windows shares on your local subnet.\n\nNotice: Ensure a media server (Universal Media Server, Plex, Kodi, Windows Media Sharing) or SMB file server is active on your LAN, and verify UPnP is enabled in Settings -> Network.");
+      });
+    });
+
+    space(1);
+  });
+
+  widget(container_y, {
+    align: top;
+    PageHeader($self.model.metadata.title);
+  });
+});

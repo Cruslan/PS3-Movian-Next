@@ -58,7 +58,11 @@ typedef struct video_decoder {
   // Temporary picture
 
   struct SwsContext *vd_sws;
-  AVPicture vd_convert;
+  /**
+   * Modern FFmpeg AVFrame buffer used for software color conversion (e.g. Swscale YUV420P conversion).
+   * Replaces legacy AVPicture structure which has been completely removed in FFmpeg 5.0+.
+   */
+  struct AVFrame *vd_convert_frame;
   int vd_convert_width;
   int vd_convert_height;
   int vd_convert_pixfmt;

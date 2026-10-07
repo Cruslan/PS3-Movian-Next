@@ -176,6 +176,14 @@ file_open_file(prop_t *page, const char *url, fa_stat_t *fs,
 	       prop_t *model, prop_t *loading, prop_t *io,
 	       prop_t *loading_status)
 {
+  /* Fast-path: Directly launch video player for known video/DVD extensions without
+   * blocking the UI thread with synchronous Libav software decoding stream probes. */
+  int ctype = contenttype_from_filename(url);
+  if(ctype == CONTENT_VIDEO || ctype == CONTENT_DVD) {
+    backend_open_video(page, url, 0);
+    return;
+  }
+
   char errbuf[200];
   metadata_t *md = NULL;
 

@@ -227,6 +227,15 @@ typedef struct vdec_decoder {
   int crop_right, crop_bottom;
 
   /**
+   * @brief Pointer to the active media pipeline.
+   *
+   * Stored to enable asynchronous UI notification dispatches from decoder callbacks
+   * (e.g. warning banners when unsupported high-frame-rate 1080p60 bitstreams are detected).
+   */
+  media_pipe_t *mp;
+
+
+  /**
    * @brief Dynamic buffer used to concatenate H.264 extradata (SPS/PPS NAL units)
    * directly with the initial video frame Access Unit (AU).
    *
@@ -258,6 +267,17 @@ typedef struct vdec_decoder {
   int h264_zero_poc_count;
   int h264_monotonic;
 
+  /**
+   * @brief High-framerate progressive 1080p flag and non-reference picture decimation counter.
+   *
+   * 1080p @ 60 FPS requires 489,600 macroblocks/sec, which exceeds the Cell SPU microkernel
+   * hardware decoding ceiling (~35 FPS). When active, non-reference B-pictures are dropped
+   * via VDEC_DECODER_MODE_SKIP_NON_REF to lock smooth 30 FPS playback and preserve A/V sync.
+   */
+  int is_1080p_high_fps;
+  int h264_nonref_count;
+  int notified_mitigation;
+
   uint8_t *au_buf;
   size_t au_buf_size;
 
@@ -278,8 +298,12 @@ end_sequence_and_wait(vdec_decoder_t *vdd)
   vdd->sequence_done = 0;
   vdec_end_sequence(vdd->handle);
   hts_mutex_lock(&vdd->mtx);
-  while(vdd->sequence_done == 0)
-    hts_cond_wait(&vdd->seqdone, &vdd->mtx);
+  while(vdd->sequence_done == 0) {
+    if(hts_cond_wait_timeout(&vdd->seqdone, &vdd->mtx, 2000)) {
+      TRACE(TRACE_ERROR, "VDEC", "Timeout waiting for end sequence, proceeding");
+      break;
+    }
+  }
   hts_mutex_unlock(&vdd->mtx);
   TRACE(TRACE_DEBUG, "VDEC", "Waiting for end sequence -> done");
 }
@@ -312,15 +336,33 @@ static vdec_pic_t *
 alloc_picture(vdec_decoder_t *vdd, int width, int height)
 {
   vdec_pic_t *vp = malloc(sizeof(vdec_pic_t));
+  if(unlikely(vp == NULL))
+    return NULL;
+
   int lumasize = width * height;
   vp->fi.fi_pitch[0] = width;
   vp->fi.fi_pitch[1] = width / 2;
   vp->fi.fi_pitch[2] = width / 2;
   vp->vp_size = lumasize + lumasize / 2;
-  vp->vp_offset[0] = rsx_alloc(vp->vp_size, 16);
-  if(vp->vp_offset[0] == -1)
-    panic("Cell decoder out of RSX memory. Unable to alloc %d bytes",
+  vp->vp_offset[0] = rsx_alloc(vp->vp_size, 128);
+  if(vp->vp_offset[0] == -1) {
+    /* If RSX allocation fails under low memory pressure, free oldest picture in queue */
+    hts_mutex_lock(&vdd->mtx);
+    vdec_pic_t *old_vp = LIST_FIRST(&vdd->pictures);
+    if(old_vp != NULL) {
+      vdd->num_pictures--;
+      release_picture(old_vp);
+      vp->vp_offset[0] = rsx_alloc(vp->vp_size, 128);
+    }
+    hts_mutex_unlock(&vdd->mtx);
+  }
+  if(vp->vp_offset[0] == -1) {
+    TRACE(TRACE_ERROR, "VDEC",
+          "Low VRAM: Cell decoder failed to alloc %d bytes from RSX pool",
           vp->vp_size);
+    free(vp);
+    return NULL;
+  }
 
   vp->vp_offset[1] = vp->vp_offset[0] + lumasize;
   vp->vp_offset[2] = vp->vp_offset[1] + lumasize / 4;
@@ -462,6 +504,13 @@ picture_out(vdec_decoder_t *vdd)
 
   vdd->pending_flush |= pm->flush;
 
+  if(pi->attr == VDEC_PICTURE_SKIPPED) {
+    /* Non-reference picture skipped by SPU hardware decoder:
+     * Release the picture item back to cellVdec without flushing or disrupting active presentation queue */
+    vdec_get_picture(vdd->handle, &picfmt, NULL);
+    return;
+  }
+
   if(/* pi->status != 0 ||*/ pi->attr != 0 || pm->skip) {
     vdec_get_picture(vdd->handle, &picfmt, NULL);
     reset_active_pictures(vdd, pm->skip ? "Skip" : "Error", 0);
@@ -493,7 +542,12 @@ picture_out(vdec_decoder_t *vdd)
     vdec_mpeg2_info *mpeg2 = (void *)(intptr_t)pi->codec_specific_addr;
 
     vp = alloc_picture(vdd, mpeg2->width, mpeg2->height);
+    if(unlikely(vp == NULL)) {
+      vdec_get_picture(vdd->handle, &picfmt, NULL);
+      return;
+    }
 
+    vp->fi.fi_color_space = COLOR_SPACE_UNSET;
     vp->fi.fi_width = mpeg2->width;
     vp->fi.fi_height = mpeg2->height;
     vp->fi.fi_duration = mpeg2->frame_rate <= 8 ? 
@@ -529,6 +583,10 @@ picture_out(vdec_decoder_t *vdd)
 	vp->fi.fi_dar_num = 221;
 	vp->fi.fi_dar_den = 100;
 	break;
+      default:
+	vp->fi.fi_dar_num = mpeg2->width;
+	vp->fi.fi_dar_den = mpeg2->height;
+	break;
       }
       break;
     case 1:
@@ -541,8 +599,14 @@ picture_out(vdec_decoder_t *vdd)
       break;
     }
 
+    if(vp->fi.fi_dar_num <= 0 || vp->fi.fi_dar_den <= 0) {
+      vp->fi.fi_dar_num = mpeg2->width ? mpeg2->width : 16;
+      vp->fi.fi_dar_den = mpeg2->height ? mpeg2->height : 9;
+    }
+
     snprintf(metainfo, sizeof(metainfo),
-	     "MPEG2 %dx%d%c (Cell)",
+	     "MPEG%d %dx%d%c (Cell)",
+	     mpeg2->mpeg1Flag ? 1 : 2,
 	     mpeg2->width, mpeg2->height, vp->fi.fi_interlaced ? 'i' : 'p');
 
     if(pts == AV_NOPTS_VALUE && dts != AV_NOPTS_VALUE &&
@@ -562,6 +626,12 @@ picture_out(vdec_decoder_t *vdd)
     vdec_h264_info *h264 = (void *)(intptr_t)pi->codec_specific_addr;
 
     vp = alloc_picture(vdd, h264->width, h264->height);
+    if(unlikely(vp == NULL)) {
+      vdec_get_picture(vdd->handle, &picfmt, NULL);
+      return;
+    }
+
+    vp->fi.fi_color_space = COLOR_SPACE_UNSET;
 
     vp->fi.fi_width = h264->width - vdd->crop_right;
     vp->fi.fi_height = h264->height - vdd->crop_bottom;
@@ -585,6 +655,7 @@ picture_out(vdec_decoder_t *vdd)
       vp->fi.fi_tff = 0;
       break;
     }
+
 
     if(h264->color_description_present_flag)
       vp->fi.fi_color_space = h264->matrix_coefficients;
@@ -679,6 +750,36 @@ picture_out(vdec_decoder_t *vdd)
 	       "h264 %dx%d%c (Cell)",
 	       h264->width, h264->height, vp->fi.fi_interlaced ? 'i' : 'p');
 
+    if(!vp->fi.fi_interlaced && (h264->width >= 1920 || h264->height >= 1080)) {
+      if(vp->fi.fi_duration > 0 && vp->fi.fi_duration <= 20000) {
+        if(!vdd->is_1080p_high_fps) {
+          vdd->is_1080p_high_fps = 1;
+          TRACE(TRACE_INFO, "VDEC",
+                "Runtime 1080p60 bitstream detected (duration: %d us). 30 FPS HW decimation active",
+                vp->fi.fi_duration);
+        }
+      }
+    }
+
+    if(vdd->is_1080p_high_fps) {
+      if(!vdd->notified_mitigation) {
+        vdd->notified_mitigation = 1;
+        if(vdd->mp != NULL && vdd->mp->mp_prop_notifications != NULL) {
+          notify_add(vdd->mp->mp_prop_notifications, NOTIFY_WARNING, NULL, 6,
+                     _("1080p 60 FPS H.264: Mitigation applied (30 FPS hardware decimation active)"));
+        }
+      }
+      if(vdd->level_major)
+        snprintf(metainfo, sizeof(metainfo),
+                 "h264 (Level %d.%d) %dx%d%c (Cell - Mitigation Active)",
+                 vdd->level_major, vdd->level_minor,
+                 h264->width, h264->height, vp->fi.fi_interlaced ? 'i' : 'p');
+      else
+        snprintf(metainfo, sizeof(metainfo),
+                 "h264 %dx%d%c (Cell - Mitigation Active)",
+                 h264->width, h264->height, vp->fi.fi_interlaced ? 'i' : 'p');
+    }
+
   }
 
   prop_set_string(vdd->metainfo, metainfo);
@@ -688,11 +789,17 @@ picture_out(vdec_decoder_t *vdd)
   
   vp->fi.fi_epoch = pm->epoch;
   vp->fi.fi_prescaled = 0;
-  vp->fi.fi_color_space = COLOR_SPACE_UNSET;
   vp->fi.fi_user_time = pm->user_time;
   vp->fi.fi_drive_clock = pm->drive_clock;
 
-  vdec_get_picture(vdd->handle, &picfmt, rsx_to_ppu(vp->vp_offset[0]));
+  int rpic = vdec_get_picture(vdd->handle, &picfmt, rsx_to_ppu(vp->vp_offset[0]));
+  if(unlikely(rpic != 0)) {
+    TRACE(TRACE_ERROR, "VDEC", "vdec_get_picture failed with error 0x%08x", rpic);
+  }
+
+  /* Hardware memory barrier: guarantee decoded YUV planar stores to GDDR3 VRAM
+   * are committed and visible to the RSX rasterizer before frame submission */
+  __asm__ volatile("sync" ::: "memory");
 
   vp->order = order;
 
@@ -821,6 +928,20 @@ submit_au(vdec_decoder_t *vdd, struct vdec_au *au, void *data, size_t len,
   au->packet_size = len;
   
   hts_mutex_lock(&vdd->mtx);
+
+  /* Backpressure: emit oldest buffered pictures before submitting more AUs to prevent VRAM exhaustion */
+  while(vdd->num_pictures >= 6 && data != NULL) {
+    vp = LIST_FIRST(&vdd->pictures);
+    if(vp == NULL)
+      break;
+    LIST_REMOVE(vp, link);
+    vdd->num_pictures--;
+    hts_mutex_unlock(&vdd->mtx);
+    emit_frame(vd, vp);
+    hts_mutex_lock(&vdd->mtx);
+    free(vp);
+  }
+
   vdd->submitted_au = 1;
   int r = vdec_decode_au(vdd->handle, 
 			 drop_non_ref ? VDEC_DECODER_MODE_SKIP_NON_REF : 
@@ -854,14 +975,74 @@ submit_au(vdec_decoder_t *vdd, struct vdec_au *au, void *data, size_t len,
     free(vp);
   }
 
-  while(vdd->num_pictures > 16) {
+  /* Cap in-flight pictures to 6 (~18.8MB VRAM) to prevent extent pool exhaustion.
+   * Emit rather than discard so video playback remains smooth without tearing. */
+  while(vdd->num_pictures > 6) {
     vp = LIST_FIRST(&vdd->pictures);
     assert(vp != NULL);
-    release_picture(vp);
+    LIST_REMOVE(vp, link);
     vdd->num_pictures--;
+    hts_mutex_unlock(&vdd->mtx);
+    emit_frame(vd, vp);
+    hts_mutex_lock(&vdd->mtx);
+    free(vp);
   }
 
   hts_mutex_unlock(&vdd->mtx);
+}
+
+/**
+ * @brief Inspects an Annex B H.264 Access Unit to determine if all slice NAL units
+ * are non-reference pictures (nal_ref_idc == 0).
+ *
+ * In ITU-T H.264 (Section 7.4.1), nal_ref_idc == 0 specifies that the slice is not used
+ * to reference any other picture. These pictures (typically B-frames or temporal enhancement
+ * layers in 60 FPS streams) can be safely skipped by cellVdec (VDEC_DECODER_MODE_SKIP_NON_REF)
+ * without breaking the reference picture buffer (DPB) or causing visual artifacts.
+ *
+ * Time Complexity: O(N) where N is the frame packet size for Annex B start code scanning.
+ * Space Complexity: O(1) in-place memory inspection.
+ *
+ * @param data Contiguous memory buffer formatted as Annex B byte stream.
+ * @param size Byte length of the Access Unit payload.
+ * @return 1 if all slice NAL units have nal_ref_idc == 0, 0 otherwise (reference frame or non-VCL).
+ */
+static int
+h264_au_is_non_ref(const uint8_t *data, size_t size)
+{
+  if(unlikely(data == NULL || size < 4))
+    return 0;
+
+  const uint8_t *p = data;
+  const uint8_t *end = data + size;
+  int has_vcl = 0;
+
+  while(p + 3 < end) {
+    if(p[0] == 0 && p[1] == 0) {
+      size_t sc_len = 0;
+      if(p[2] == 1) {
+        sc_len = 3;
+      } else if(p + 4 <= end && p[2] == 0 && p[3] == 1) {
+        sc_len = 4;
+      }
+      if(sc_len > 0) {
+        p += sc_len;
+        if(p < end) {
+          uint8_t nal_header = *p;
+          uint8_t type = nal_header & 0x1f;
+          uint8_t ref_idc = (nal_header >> 5) & 0x03;
+          if(type >= 1 && type <= 5) {
+            has_vcl = 1;
+            if(ref_idc != 0)
+              return 0; /* Contains a reference slice; must not be skipped */
+          }
+        }
+        continue;
+      }
+    }
+    p++;
+  }
+  return has_vcl;
 }
 
 /**
@@ -965,7 +1146,44 @@ decoder_decode(struct media_codec *mc, struct video_decoder *vd,
     }
   }
 
-  submit_au(vdd, &au, data, size, mb->mb_skip == 1, vd);
+  int is_non_ref = (mc->codec_id == AV_CODEC_ID_H264 && data != NULL && size > 4 && h264_au_is_non_ref(data, size));
+  int drop_non_ref = (mb->mb_skip == 1);
+
+  if(!drop_non_ref && is_non_ref && mc->mp != NULL) {
+    media_pipe_t *mp = mc->mp;
+    hts_mutex_lock(&mp->mp_clock_mutex);
+    int64_t aclock = mp->mp_audio_clock;
+    int64_t aclock_avtime = mp->mp_audio_clock_avtime;
+    int epoch = mp->mp_audio_clock_epoch;
+    int avdelta = mp->mp_avdelta;
+    hts_mutex_unlock(&mp->mp_clock_mutex);
+
+    int64_t vpts = mb->mb_pts;
+
+    if(aclock != PTS_UNSET && aclock_avtime > 0 && epoch == mb->mb_epoch && vpts != AV_NOPTS_VALUE) {
+      int64_t cur_avtime = arch_get_ts();
+      int64_t est_aclock = aclock + (cur_avtime - aclock_avtime) + avdelta;
+      int64_t drift = est_aclock - vpts;
+
+      /* If video PTS is more than 25ms behind audio master clock (~1.5 frames at 60fps),
+       * hardware skip this non-reference picture to immediately catch up and prevent A/V desync */
+      if(drift > 25000) {
+        drop_non_ref = 1;
+      }
+    }
+
+    /* Proactive 1080p60 decimation: 1080p progressive streams exceeding 45 FPS
+     * overwhelm Cell SPU macroblock throughput (~35 FPS hardware ceiling).
+     * Proactively skip non-reference pictures to lock smooth 30 FPS playback */
+    if(!drop_non_ref && vdd->is_1080p_high_fps) {
+      vdd->h264_nonref_count++;
+      if(vdd->h264_nonref_count & 1) {
+        drop_non_ref = 1;
+      }
+    }
+  }
+
+  submit_au(vdd, &au, data, size, drop_non_ref, vd);
 }
 
 
@@ -1014,6 +1232,9 @@ decoder_close(struct media_codec *mc)
 {
   vdec_decoder_t *vdd = mc->opaque;
 
+  /* Stop active SPU decoding sequence and flush pipeline before releasing resources */
+  end_sequence_and_wait(vdd);
+
   TRACE(TRACE_DEBUG, "VDEC", "Freeing picture list");
   free_picture_list(&vdd->pictures);
 
@@ -1059,6 +1280,7 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
   int crop_bottom = 0;
 
   switch(mc->codec_id) {
+  case AV_CODEC_ID_MPEG1VIDEO:
   case AV_CODEC_ID_MPEG2VIDEO:
 
     hts_lwmutex_lock(&ps3_codec_sysmodule_mutex);
@@ -1075,16 +1297,17 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
 
     dec_type.codec_type = VDEC_CODEC_TYPE_MPEG2;
     dec_type.profile_level = VDEC_MPEG2_MP_HL;
+    /* Allocate 1 SPU for MPEG-1 / MPEG-2 (Sony cellVdec MPEG firmware standard specification) */
     spu_threads = 1;
     break;
 
-  case AV_CODEC_ID_H264:
+  case AV_CODEC_ID_H264: {
     if(mcp != NULL) {
       TRACE(TRACE_DEBUG, "VDEC", "H264: Profile:%d Level:%d",
             mcp->profile, mcp->level);
 
-      if(mcp->profile != FF_PROFILE_H264_CONSTRAINED_BASELINE &&
-         mcp->profile >= FF_PROFILE_H264_HIGH_10) {
+      if(mcp->profile != AV_PROFILE_H264_CONSTRAINED_BASELINE &&
+         mcp->profile >= AV_PROFILE_H264_HIGH_10) {
         TRACE(TRACE_DEBUG, "VDEC",
               "Refusing to play h264 profile %d", mcp->profile);
 	return 1; // No 10bit support
@@ -1143,6 +1366,8 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
       }
     }
 
+  }
+
     hts_lwmutex_lock(&ps3_codec_sysmodule_mutex);
     if(vdec_h264_loaded == -1) {
       int ret = SysLoadModule(SYSMODULE_VDEC_H264);
@@ -1161,6 +1386,7 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
 		 _("Cell-h264: Forcing level 4.2 for content in level %d.%d. This may break video playback."), mcp->level / 10, mcp->level % 10);
     }
     dec_type.profile_level = 42;
+    /* Allocate 4 SPUs for H.264 (optimal Sony cellVdec microcode balance; preserves 2 SPUs for GameOS/system) */
     spu_threads = 4;
     break;
 
@@ -1176,6 +1402,25 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
   }
 
   vdd = calloc(1, sizeof(vdec_decoder_t));
+  vdd->mp = mp;
+
+  if(mc->codec_id == AV_CODEC_ID_H264 && mcp != NULL) {
+    float fps = 0.0f;
+    if(mcp->frame_rate_den > 0)
+      fps = (float)mcp->frame_rate_num / (float)mcp->frame_rate_den;
+    else if(mp->mp_framerate.den > 0)
+      fps = (float)mp->mp_framerate.num / (float)mp->mp_framerate.den;
+
+    if((mcp->width >= 1920 || mcp->height >= 1080) && fps > 45.0f) {
+      vdd->is_1080p_high_fps = 1;
+      vdd->notified_mitigation = 1;
+      notify_add(mp->mp_prop_notifications, NOTIFY_WARNING, NULL, 6,
+                 _("1080p 60 FPS H.264: Mitigation applied (30 FPS hardware decimation active)"));
+      TRACE(TRACE_INFO, "VDEC",
+            "1080p high-framerate stream detected (%.1f fps). Enabling 30 FPS hardware decimation",
+            fps);
+    }
+  }
 
 
 #define ROUND_UP(p, round) ((p + round - 1) & ~(round - 1))
@@ -1192,13 +1437,12 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
   vdd->mem = (void *)(uint64_t)taddr;
 
   TRACE(TRACE_DEBUG, "VDEC", "Opening codec %s level %d using %d bytes of RAM",
-	mc->codec_id == AV_CODEC_ID_H264 ? "h264" : "MPEG2",
+	mc->codec_id == AV_CODEC_ID_H264 ? "h264" : (mc->codec_id == AV_CODEC_ID_MPEG1VIDEO ? "MPEG1" : "MPEG2"),
 	dec_type.profile_level,
 	dec_attr.mem_size);
 
   vdd->config.mem_addr = (intptr_t)vdd->mem;
   vdd->config.mem_size = dec_attr.mem_size;
-  vdd->config.num_spus = spu_threads;
   vdd->config.ppu_thread_prio = THREAD_PRIO_VDEC;
   vdd->config.spu_thread_prio = VDEC_SPU_PRIO;
   vdd->config.ppu_thread_stack_size = 1 << 14;
@@ -1207,10 +1451,22 @@ video_ps3_vdec_codec_create(media_codec_t *mc, const media_codec_params_t *mcp,
   c.fn = init_opd32(&vdd->cb_opd, (void *)decoder_callback);
   c.arg = (uint32_t)(uintptr_t)vdd;
 
-  r = vdec_open(&dec_type, &vdd->config, &c, &vdd->handle);
+  /* Attempt hardware initialization with maximum requested SPUs; gracefully fallback on failure */
+  int requested_spus = spu_threads;
+  for (; spu_threads >= 1; spu_threads--) {
+    vdd->config.num_spus = spu_threads;
+    r = vdec_open(&dec_type, &vdd->config, &c, &vdd->handle);
+    if(r == 0) {
+      TRACE(TRACE_INFO, "VDEC", "Cell codec opened successfully with %d SPUs", spu_threads);
+      break;
+    }
+    TRACE(TRACE_INFO, "VDEC", "vdec_open failed with %d SPUs (0x%x), retrying with %d",
+          spu_threads, r, spu_threads - 1);
+  }
+
   if(r) {
     notify_add(mp->mp_prop_notifications, NOTIFY_WARNING, NULL, 10,
-	       _("Unable to open Cell codec. Error 0x%x"), r);
+	       _("Unable to open Cell codec (%d SPUs attempted). Error 0x%x"), requested_spus, r);
     Lv2Syscall1(349, (uint64_t)vdd->mem);
     free(vdd);
     return 1;

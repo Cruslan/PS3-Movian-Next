@@ -429,9 +429,16 @@ static struct strtab postfixtab[] = {
   { "flv",             CONTENT_VIDEO },
   { "vob",             CONTENT_VIDEO },
   { "m2v",             CONTENT_VIDEO },
+  { "m1v",             CONTENT_VIDEO },
+  { "mpeg",            CONTENT_VIDEO },
+  { "mpe",             CONTENT_VIDEO },
+  { "m2t",             CONTENT_VIDEO },
   { "dv",              CONTENT_VIDEO },
+  { "dif",             CONTENT_VIDEO },
   { "asf",             CONTENT_VIDEO },
   { "ogv",             CONTENT_VIDEO },
+  { "av1",             CONTENT_VIDEO },
+  { "ivf",             CONTENT_VIDEO },
 
   { "sid",             CONTENT_ALBUM },
 

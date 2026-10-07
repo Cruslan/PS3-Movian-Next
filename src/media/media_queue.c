@@ -107,6 +107,8 @@ mp_flush_locked(media_pipe_t *mp, int final)
     atomic_dec(&media_buffer_hungry);
     mp->mp_satisfied = 1;
   }
+
+  hts_cond_broadcast(&mp->mp_backpressure);
 }
 
 
@@ -237,6 +239,11 @@ mb_enqueue_with_events(media_pipe_t *mp, media_queue_t *mq, media_buf_t *mb)
 
     if(mp->mp_audio.mq_packets_current < aminpkt)
       break;
+
+    if(cancellable_is_cancelled(mp->mp_cancellable)) {
+      hts_mutex_unlock(&mp->mp_mutex);
+      return event_create_type(EVENT_EXIT);
+    }
 
     hts_cond_wait(&mp->mp_backpressure, &mp->mp_mutex);
   }
@@ -403,8 +410,13 @@ mp_wait_for_empty_queues(media_pipe_t *mp)
   // Only wait for data queues to drain, aux (subtitles) might be stalled
   while((e = TAILQ_FIRST(&mp->mp_eq)) == NULL &&
 	(TAILQ_FIRST(&mp->mp_audio.mq_q_data) != NULL ||
-         TAILQ_FIRST(&mp->mp_video.mq_q_data) != NULL))
+         TAILQ_FIRST(&mp->mp_video.mq_q_data) != NULL)) {
+    if(cancellable_is_cancelled(mp->mp_cancellable)) {
+      hts_mutex_unlock(&mp->mp_mutex);
+      return event_create_type(EVENT_EXIT);
+    }
     hts_cond_wait(&mp->mp_backpressure, &mp->mp_mutex);
+  }
 
   if(e != NULL)
     TAILQ_REMOVE(&mp->mp_eq, e, e_link);

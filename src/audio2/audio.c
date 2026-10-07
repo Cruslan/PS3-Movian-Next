@@ -36,6 +36,7 @@
 
 #include <libavutil/opt.h>
 #include <libavutil/mem.h>
+#include <libavutil/audio_fifo.h>
 
 #if CONFIG_GLW_REC
 #include "ui/glw/glw_rec.h"
@@ -214,9 +215,19 @@ audio_decoder_destroy(struct audio_decoder *ad)
   mq_flush(ad->ad_mp, &ad->ad_mp->mp_audio, 1);
   av_frame_free(&ad->ad_frame);
 
+  if(ad->ad_fifo != NULL) {
+    av_audio_fifo_free(ad->ad_fifo);
+    ad->ad_fifo = NULL;
+  }
+
+  if(ad->ad_conv_buf != NULL) {
+    free(ad->ad_conv_buf);
+    ad->ad_conv_buf = NULL;
+    ad->ad_conv_samples = 0;
+  }
+
   if(ad->ad_avr != NULL) {
-    avresample_close(ad->ad_avr);
-    avresample_free(&ad->ad_avr);
+    swr_free(&ad->ad_avr);
   }
 
   audio_cleanup_spdif_muxer(ad);
@@ -225,10 +236,12 @@ audio_decoder_destroy(struct audio_decoder *ad)
 
 
 /**
- *
+ * Write callback for FFmpeg S/PDIF bitstream packetizer.
+ * In modern FFmpeg, the buffer payload pointer is strictly const qualified
+ * to prevent accidental in-situ mutation of packet data during I/O.
  */
 static int
-spdif_mux_write(void *opaque, uint8_t *buf, int buf_size)
+spdif_mux_write(void *opaque, const uint8_t *buf, int buf_size)
 {
   audio_decoder_t *ad = opaque;
   int nl = ad->ad_spdif_frame_size + buf_size;
@@ -276,9 +289,9 @@ audio_set_passthru_metadata(audio_decoder_t *ad, const AVCodec *codec,
  *
  */
 static void
-audio_setup_spdif_muxer(audio_decoder_t *ad, AVCodec *codec)
+audio_setup_spdif_muxer(audio_decoder_t *ad, const AVCodec *codec)
 {
-  AVOutputFormat *ofmt = av_guess_format("spdif", NULL, NULL);
+  const AVOutputFormat *ofmt = av_guess_format("spdif", NULL, NULL);
   if(ofmt == NULL)
     return;
 
@@ -291,22 +304,17 @@ audio_setup_spdif_muxer(audio_decoder_t *ad, AVCodec *codec)
   fctx->pb = avio_alloc_context(ad->ad_mux_buffer, mux_buffer_size,
 				1, ad, NULL, spdif_mux_write, NULL);
   AVStream *s = avformat_new_stream(fctx, codec);
-  s->codec->sample_rate = 48000; // ???
-  if(avcodec_open2(s->codec, codec, NULL)) {
+  s->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+  s->codecpar->codec_id = codec->id;
+  s->codecpar->sample_rate = 48000;
 
-    TRACE(TRACE_ERROR, "audio", "Unable to open %s codec for SPDIF",
-	  codec->name);
-  bad:
-    av_free(fctx->pb);
+  if(avformat_write_header(fctx, NULL)) {
+    TRACE(TRACE_ERROR, "audio", "Unable to open SPDIF muxer");
+    avio_context_free(&fctx->pb);
     free(ad->ad_mux_buffer);
     ad->ad_mux_buffer = NULL;
     avformat_free_context(fctx);
     return;
-  }
-
-  if(avformat_write_header(fctx, NULL)) {
-    TRACE(TRACE_ERROR, "audio", "Unable to open SPDIF muxer");
-    goto bad;
   }
   ad->ad_spdif_muxer = fctx;
   TRACE(TRACE_DEBUG, "audio", "SPDIF muxer opened");
@@ -353,7 +361,200 @@ update_abitrate(media_pipe_t *mp, media_queue_t *mq,
 
 
 /**
- * Return 1 if packet should be retained (more data to be extracted)
+ * @brief Processes a single decoded audio frame and feeds converted PCM into the FIFO.
+ *
+ * Checks stream properties, reconfigures SwrContext and AVAudioFifo when input
+ * format or channel layout changes, computes A/V sync clock timestamps, and converts
+ * input PCM to the PS3 audio sink format (interleaved float 48kHz).
+ *
+ * @param ad Pointer to audio decoder instance.
+ * @param mp Pointer to media pipeline.
+ * @param mq Pointer to audio media queue.
+ * @param ctx Pointer to active AVCodecContext (or NULL for uncompressed PCM).
+ * @param frame Pointer to decoded AVFrame.
+ * @param mb Pointer to container media buffer.
+ */
+static void
+audio_handle_frame(audio_decoder_t *ad, media_pipe_t *mp,
+                   media_queue_t *mq, AVCodecContext *ctx,
+                   AVFrame *frame, media_buf_t *mb)
+{
+  const audio_class_t *ac = ad->ad_ac;
+  uint64_t frame_channel_layout = 0;
+
+  if(frame->sample_rate == 0) {
+    if(ctx != NULL)
+      frame->sample_rate = ctx->sample_rate;
+
+    if(frame->sample_rate == 0 && mb->mb_cw && mb->mb_cw->fmt_ctx)
+      frame->sample_rate = mb->mb_cw->fmt_ctx->sample_rate;
+
+    if(frame->sample_rate == 0) {
+      if(!ad->ad_sample_rate_fail) {
+        ad->ad_sample_rate_fail = 1;
+        TRACE(TRACE_ERROR, "Audio", "Unable to determine sample rate");
+      }
+      return;
+    }
+  }
+
+  /*
+   * Extract 64-bit channel layout mask from modern AVChannelLayout structure.
+   * Native channel orders provide the bitmask directly; otherwise query the layout subset.
+   */
+  if(frame->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) {
+    frame_channel_layout = frame->ch_layout.u.mask;
+  } else if(frame->ch_layout.nb_channels > 0) {
+    frame_channel_layout = av_channel_layout_subset(&frame->ch_layout, ~(uint64_t)0);
+  }
+  if(frame_channel_layout == 0 && ctx != NULL) {
+    if(ctx->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) {
+      frame_channel_layout = ctx->ch_layout.u.mask;
+    } else if(ctx->ch_layout.nb_channels > 0) {
+      frame_channel_layout = av_channel_layout_subset(&ctx->ch_layout, ~(uint64_t)0);
+    }
+  }
+  if(frame_channel_layout == 0) {
+    if(!ad->ad_channel_layout_fail) {
+      ad->ad_channel_layout_fail = 1;
+      TRACE(TRACE_ERROR, "Audio",
+            "Unable to map %d channels to channel layout",
+            frame->ch_layout.nb_channels);
+    }
+    return;
+  }
+
+  if(ctx != NULL)
+    mp_set_mq_meta(mq, ctx->codec, ctx);
+
+  if(mb->mb_pts != PTS_UNSET) {
+    int od = 0, id = 0;
+
+    if(ad->ad_fifo != NULL) {
+      od = av_audio_fifo_size(ad->ad_fifo) * 1000000LL / ad->ad_out_sample_rate;
+    }
+    if(ad->ad_avr != NULL) {
+      id = swr_get_delay(ad->ad_avr, 1000000);
+    }
+    ad->ad_pts = mb->mb_pts - od - id;
+    ad->ad_epoch = mb->mb_epoch;
+
+    if(mb->mb_drive_clock) {
+      assert(mb->mb_drive_clock == 1);
+      mp_set_current_time(mp, mb->mb_user_time, mb->mb_epoch, ad->ad_delay);
+    }
+
+    mb->mb_pts = PTS_UNSET; // No longer valid
+    mb->mb_user_time = PTS_UNSET;
+  }
+
+  if(frame->sample_rate    != ad->ad_in_sample_rate ||
+     frame->format         != ad->ad_in_sample_format ||
+     frame_channel_layout  != ad->ad_in_channel_layout ||
+     ad->ad_want_reconfig) {
+
+    ad->ad_want_reconfig = 0;
+    ad->ad_in_sample_rate    = frame->sample_rate;
+    ad->ad_in_sample_format  = frame->format;
+    ad->ad_in_channel_layout = frame_channel_layout;
+
+    ac->ac_reconfig(ad);
+
+    if(ad->ad_avr != NULL) {
+      swr_free(&ad->ad_avr);
+    }
+    if(ad->ad_fifo != NULL) {
+      av_audio_fifo_free(ad->ad_fifo);
+      ad->ad_fifo = NULL;
+    }
+
+    AVChannelLayout in_layout = {0};
+    AVChannelLayout out_layout = {0};
+
+    av_channel_layout_from_mask(&in_layout, ad->ad_in_channel_layout);
+    av_channel_layout_from_mask(&out_layout, ad->ad_out_channel_layout);
+
+    ad->ad_out_channels = out_layout.nb_channels;
+
+    int r_swr = swr_alloc_set_opts2(&ad->ad_avr,
+                                   &out_layout, ad->ad_out_sample_format, ad->ad_out_sample_rate,
+                                   &in_layout, ad->ad_in_sample_format, ad->ad_in_sample_rate,
+                                   0, NULL);
+
+    char buf1[128];
+    char buf2[128];
+
+    av_channel_layout_describe(&in_layout, buf1, sizeof(buf1));
+    av_channel_layout_describe(&out_layout, buf2, sizeof(buf2));
+
+    av_channel_layout_uninit(&in_layout);
+    av_channel_layout_uninit(&out_layout);
+
+    TRACE(TRACE_DEBUG, "Audio",
+          "Converting from [%s %dHz %s] to [%s %dHz %s]",
+          buf1, ad->ad_in_sample_rate,
+          av_get_sample_fmt_name(ad->ad_in_sample_format),
+          buf2, ad->ad_out_sample_rate,
+          av_get_sample_fmt_name(ad->ad_out_sample_format));
+
+    if(r_swr < 0 || ad->ad_avr == NULL || swr_init(ad->ad_avr) < 0) {
+      TRACE(TRACE_ERROR, "Audio", "Unable to open resampler");
+      if(ad->ad_avr)
+        swr_free(&ad->ad_avr);
+    } else {
+      /* Initialize AVAudioFifo to buffer converted output samples for the PS3 audio sink */
+      ad->ad_fifo = av_audio_fifo_alloc(ad->ad_out_sample_format, ad->ad_out_channels, 4096);
+    }
+
+    prop_set(mp->mp_prop_ctrl, "canAdjustVolume", PROP_SET_INT, 1);
+
+    if(ac->ac_set_volume != NULL)
+      ac->ac_set_volume(ad, ad->ad_vol_scale);
+
+  }
+
+  ad->ad_estimated_duration =
+    1000000LL * frame->nb_samples / frame->sample_rate;
+
+  if(ad->ad_avr != NULL && ad->ad_fifo != NULL) {
+    /*
+     * Query maximum possible output samples and convert input PCM directly
+     * into intermediate conversion buffer, then push into AVAudioFifo.
+     */
+    int max_out = swr_get_out_samples(ad->ad_avr, frame->nb_samples);
+    if(max_out > 0) {
+      int bytes_per_sample = av_get_bytes_per_sample(ad->ad_out_sample_format);
+      if(max_out > ad->ad_conv_samples) {
+        ad->ad_conv_buf = realloc(ad->ad_conv_buf, max_out * ad->ad_out_channels * bytes_per_sample);
+        ad->ad_conv_samples = max_out;
+      }
+      uint8_t *out_planes[1] = { (uint8_t *)ad->ad_conv_buf };
+      int converted = swr_convert(ad->ad_avr, out_planes, max_out,
+                                  (const uint8_t * const *)frame->data,
+                                  frame->nb_samples);
+      if(converted > 0) {
+        av_audio_fifo_write(ad->ad_fifo, (void * const *)out_planes, converted);
+      }
+    }
+  } else {
+    usleep(ad->ad_estimated_duration);
+  }
+
+#if CONFIG_GLW_REC
+  glw_rec_audio_send(ad, frame, PTS_UNSET);
+#endif
+}
+
+
+/**
+ * @brief Demuxes and decodes audio packets using modern FFmpeg send/receive API.
+ *
+ * Consumes media buffer packets, dispatches S/PDIF or direct bitstream pass-through,
+ * or feeds packets to libavcodec and pushes reconstructed PCM audio into the FIFO.
+ *
+ * @param ad Pointer to audio decoder instance.
+ * @param mb Pointer to media buffer packet.
+ * @return int 0 indicating the media buffer was completely consumed.
  */
 static int
 audio_process_audio(audio_decoder_t *ad, media_buf_t *mb)
@@ -362,8 +563,6 @@ audio_process_audio(audio_decoder_t *ad, media_buf_t *mb)
   AVFrame *frame = ad->ad_frame;
   media_pipe_t *mp = ad->ad_mp;
   media_queue_t *mq = &mp->mp_audio;
-  int r;
-  int got_frame;
 
   if(mb->mb_skip || mb->mb_stream != mq->mq_stream)
     return 0;
@@ -378,13 +577,15 @@ audio_process_audio(audio_decoder_t *ad, media_buf_t *mb)
   if(mb->mb_cw == NULL) {
     frame->sample_rate = mb->mb_rate;
     frame->format = AV_SAMPLE_FMT_S16;
+
+    av_channel_layout_uninit(&frame->ch_layout);
     switch(mb->mb_channels) {
     case 1:
-      frame->channel_layout = AV_CH_LAYOUT_MONO;
+      av_channel_layout_from_mask(&frame->ch_layout, AV_CH_LAYOUT_MONO);
       frame->nb_samples = mb->mb_size / 2;
       break;
     case 2:
-      frame->channel_layout = AV_CH_LAYOUT_STEREO;
+      av_channel_layout_from_mask(&frame->ch_layout, AV_CH_LAYOUT_STEREO);
       frame->nb_samples = mb->mb_size / 4;
       break;
     default:
@@ -392,24 +593,21 @@ audio_process_audio(audio_decoder_t *ad, media_buf_t *mb)
     }
     frame->data[0] = mb->mb_data;
     frame->linesize[0] = 0;
-    r = mb->mb_size;
-    got_frame = 1;
 
+    audio_handle_frame(ad, mp, mq, NULL, frame, mb);
     update_abitrate(mp, mq, mb->mb_size, ad);
+    return 0;
 
   } else {
 
     media_codec_t *mc = mb->mb_cw;
-
     AVCodecContext *ctx = mc->ctx;
 
     if(mc->codec_id != ad->ad_in_codec_id) {
-      AVCodec *codec = avcodec_find_decoder(mc->codec_id);
+      const AVCodec *codec = avcodec_find_decoder(mc->codec_id);
       TRACE(TRACE_DEBUG, "audio", "Codec changed to %s (0x%x)",
             codec ? codec->name : "???", mc->codec_id);
       ad->ad_in_codec_id = mc->codec_id;
-      ad->ad_in_sample_rate = 0;
-
       audio_cleanup_spdif_muxer(ad);
 
       ad->ad_mode = ac->ac_get_mode != NULL ?
@@ -444,172 +642,49 @@ audio_process_audio(audio_decoder_t *ad, media_buf_t *mb)
       return 0;
     }
 
-
     if(ad->ad_mode == AUDIO_MODE_CODED) {
       ad->ad_pts = mb->mb_pts;
       ad->ad_epoch = mb->mb_epoch;
-
-
     }
 
-
     if(ctx == NULL) {
-
-      AVCodec *codec = avcodec_find_decoder(mc->codec_id);
+      const AVCodec *codec = avcodec_find_decoder(mc->codec_id);
       assert(codec != NULL); // Checked in libav.c
 
       ctx = mc->ctx = avcodec_alloc_context3(codec);
-
-      if(ad->ad_stereo_downmix)
-        ctx->request_channel_layout = AV_CH_LAYOUT_STEREO;
+      mc->ctx->thread_count = 1;
 
       if(avcodec_open2(mc->ctx, codec, NULL) < 0) {
-        av_freep(&mc->ctx);
+        avcodec_free_context(&mc->ctx);
         return 0;
       }
     }
 
-    r = avcodec_decode_audio4(ctx, frame, &got_frame, &mb->mb_pkt);
-    if(r < 0)
+    /**
+     * Modern FFmpeg asynchronous audio decoding contract:
+     * Feed the packet to the decoder via avcodec_send_packet.
+     * If the decoder's internal buffers are full (AVERROR(EAGAIN)), drain
+     * all reconstructed frames first and retry packet submission.
+     */
+    int send_ret = avcodec_send_packet(ctx, &mb->mb_pkt);
+    if(send_ret == AVERROR(EAGAIN)) {
+      while(avcodec_receive_frame(ctx, frame) == 0) {
+        audio_handle_frame(ad, mp, mq, ctx, frame, mb);
+        av_frame_unref(frame);
+      }
+      send_ret = avcodec_send_packet(ctx, &mb->mb_pkt);
+    }
+    if(send_ret < 0 && send_ret != AVERROR_EOF)
       return 0;
-    update_abitrate(mp, mq, r, ad);
 
-    if(frame->sample_rate == 0) {
-      frame->sample_rate = ctx->sample_rate;
-
-      if(frame->sample_rate == 0 && mb->mb_cw->fmt_ctx)
-        frame->sample_rate = mb->mb_cw->fmt_ctx->sample_rate;
-
-      if(frame->sample_rate == 0) {
-
-        if(!ad->ad_sample_rate_fail) {
-          ad->ad_sample_rate_fail = 1;
-          TRACE(TRACE_ERROR, "Audio",
-                "Unable to determine sample rate");
-        }
-        return 0;
-      }
+    while(avcodec_receive_frame(ctx, frame) == 0) {
+      audio_handle_frame(ad, mp, mq, ctx, frame, mb);
+      av_frame_unref(frame);
     }
 
-    if(frame->channel_layout == 0) {
-      frame->channel_layout = av_get_default_channel_layout(ctx->channels);
-      if(frame->channel_layout == 0) {
-
-        if(!ad->ad_channel_layout_fail) {
-          ad->ad_channel_layout_fail = 1;
-          TRACE(TRACE_ERROR, "Audio",
-                "Unable to map %d channels to channel layout",
-                ctx->channels);
-        }
-        return 0;
-      }
-    }
-
-    mp_set_mq_meta(mq, ctx->codec, ctx);
+    update_abitrate(mp, mq, mb->mb_size, ad);
+    return 0;
   }
-
-  if(mb->mb_pts != PTS_UNSET) {
-
-    int od = 0, id = 0;
-
-    if(ad->ad_avr != NULL) {
-      od = avresample_available(ad->ad_avr) *
-        1000000LL / ad->ad_out_sample_rate;
-      id = avresample_get_delay(ad->ad_avr) *
-        1000000LL / frame->sample_rate;
-    }
-    ad->ad_pts = mb->mb_pts - od - id;
-    ad->ad_epoch = mb->mb_epoch;
-
-    if(mb->mb_drive_clock) {
-      assert(mb->mb_drive_clock == 1);
-      mp_set_current_time(mp, mb->mb_user_time, mb->mb_epoch, ad->ad_delay);
-    }
-
-    mb->mb_pts = PTS_UNSET; // No longer valid
-    mb->mb_user_time = PTS_UNSET;
-  }
-
-
-  mb->mb_data += r;
-  mb->mb_size -= r;
-
-  if(!got_frame)
-    return mb->mb_size > 0;
-
-
-  if(frame->sample_rate    != ad->ad_in_sample_rate ||
-     frame->format         != ad->ad_in_sample_format ||
-     frame->channel_layout != ad->ad_in_channel_layout ||
-     ad->ad_want_reconfig) {
-
-    ad->ad_want_reconfig = 0;
-    ad->ad_in_sample_rate    = frame->sample_rate;
-    ad->ad_in_sample_format  = frame->format;
-    ad->ad_in_channel_layout = frame->channel_layout;
-
-    ac->ac_reconfig(ad);
-
-    if(ad->ad_avr == NULL)
-      ad->ad_avr = avresample_alloc_context();
-    else
-      avresample_close(ad->ad_avr);
-
-    av_opt_set_int(ad->ad_avr, "in_sample_fmt",
-                   ad->ad_in_sample_format, 0);
-    av_opt_set_int(ad->ad_avr, "in_sample_rate",
-                   ad->ad_in_sample_rate, 0);
-    av_opt_set_int(ad->ad_avr, "in_channel_layout",
-                   ad->ad_in_channel_layout, 0);
-
-    av_opt_set_int(ad->ad_avr, "out_sample_fmt",
-                   ad->ad_out_sample_format, 0);
-    av_opt_set_int(ad->ad_avr, "out_sample_rate",
-                   ad->ad_out_sample_rate, 0);
-    av_opt_set_int(ad->ad_avr, "out_channel_layout",
-                   ad->ad_out_channel_layout, 0);
-
-    char buf1[128];
-    char buf2[128];
-
-    av_get_channel_layout_string(buf1, sizeof(buf1),
-                                 -1, ad->ad_in_channel_layout);
-    av_get_channel_layout_string(buf2, sizeof(buf2),
-                                 -1, ad->ad_out_channel_layout);
-
-    TRACE(TRACE_DEBUG, "Audio",
-          "Converting from [%s %dHz %s] to [%s %dHz %s]",
-          buf1, ad->ad_in_sample_rate,
-          av_get_sample_fmt_name(ad->ad_in_sample_format),
-          buf2, ad->ad_out_sample_rate,
-          av_get_sample_fmt_name(ad->ad_out_sample_format));
-
-    if(avresample_open(ad->ad_avr)) {
-      TRACE(TRACE_ERROR, "Audio", "Unable to open resampler");
-      avresample_free(&ad->ad_avr);
-    }
-
-    prop_set(mp->mp_prop_ctrl, "canAdjustVolume", PROP_SET_INT, 1);
-
-    if(ac->ac_set_volume != NULL)
-      ac->ac_set_volume(ad, ad->ad_vol_scale);
-
-  }
-  ad->ad_estimated_duration =
-    1000000LL * frame->nb_samples / frame->sample_rate;
-
-  if(ad->ad_avr != NULL) {
-    avresample_convert(ad->ad_avr, NULL, 0, 0,
-                       frame->data, frame->linesize[0],
-                       frame->nb_samples);
-  } else {
-    usleep(ad->ad_estimated_duration);
-  }
-#if CONFIG_GLW_REC
-  glw_rec_audio_send(ad, frame, PTS_UNSET);
-#endif
-
-  return mb->mb_size > 0;
 }
 
 
@@ -641,7 +716,7 @@ audio_decode_thread(void *aux)
     if(ad->ad_spdif_muxer != NULL) {
       avail = ad->ad_spdif_frame_size;
     } else {
-      avail = ad->ad_avr != NULL ? avresample_available(ad->ad_avr) : 0;
+      avail = ad->ad_fifo != NULL ? av_audio_fifo_size(ad->ad_fifo) : 0;
     }
     media_buf_t *data = TAILQ_FIRST(&mq->mq_q_data);
     media_buf_t *ctrl = TAILQ_FIRST(&mq->mq_q_ctrl);
@@ -765,9 +840,11 @@ audio_decode_thread(void *aux)
 	  mp->mp_seek_audio_done(mp);
 	ad->ad_discontinuity = 1;
 
+	if(ad->ad_fifo != NULL) {
+	  av_audio_fifo_reset(ad->ad_fifo);
+	}
 	if(ad->ad_avr != NULL) {
-	  avresample_read(ad->ad_avr, NULL, avresample_available(ad->ad_avr));
-	  assert(avresample_available(ad->ad_avr) == 0);
+	  swr_init(ad->ad_avr);
 	}
 	break;
 

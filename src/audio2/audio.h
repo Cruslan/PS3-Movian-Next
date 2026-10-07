@@ -19,7 +19,8 @@
  */
 #pragma once
 #include <libavutil/samplefmt.h>
-#include <libavresample/avresample.h>
+#include <libavutil/audio_fifo.h>
+#include <libswresample/swresample.h>
 
 #include "arch/threads.h"
 #include "media/media.h"
@@ -91,11 +92,23 @@ typedef struct audio_decoder {
   int ad_out_sample_rate;
   enum AVSampleFormat ad_out_sample_format;
   int64_t ad_out_channel_layout;
+  int ad_out_channels;
 
-  int ad_stereo_downmix; /* We can only output stereo so ask for downmix
-			    as early as codec initialization */
+  /** Modern FFmpeg audio resampler context */
+  struct SwrContext *ad_avr;
 
-  AVAudioResampleContext *ad_avr;
+  /**
+   * Modern FFmpeg audio sample FIFO buffer.
+   * Caches resampled/converted PCM samples before delivering them to the PS3 GameOS audio sink.
+   */
+  struct AVAudioFifo *ad_fifo;
+
+  /**
+   * Dynamic intermediate conversion buffer used by swr_convert() before pushing
+   * converted samples into ad_fifo.
+   */
+  void *ad_conv_buf;
+  int ad_conv_samples;
 
   void *ad_mux_buffer;
   

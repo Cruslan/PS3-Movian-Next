@@ -319,6 +319,8 @@ mp_reset(media_pipe_t *mp)
   mp_add_track_off(mp->mp_prop_subtitle_tracks, "sub:off");
   prop_set_string(mp->mp_prop_subtitle_track_current, "sub:off");
   prop_set_int(mp->mp_prop_subtitle_track_current_manual, 0);
+
+  prop_set_void(mp->mp_prop_playstatus);
 }
 
 

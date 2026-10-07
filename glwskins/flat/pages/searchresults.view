@@ -72,6 +72,44 @@ widget(container_z, {
 
   ScrollBar("scrollable", 3em, $ui.universeBottomHeight);
 
+  // Informational empty state when no media extensions or search hits exist
+  widget(container_y, {
+    hidden: count($self.model.nodes) > 0 || $self.model.loading > 0;
+    space(1);
+
+    widget(container_y, {
+      align: center;
+      width: select($ui.aspect > 1, $ui.width * 0.65, $ui.width - 4em);
+      spacing: 1.2em;
+
+      widget(icon, {
+        align: center;
+        size: 4em;
+        source: "skin://icons/ic_search_48px.svg";
+        alpha: 0.35;
+      });
+
+      widget(label, {
+        align: center;
+        caption: _("No Search Results");
+        size: 1.6em;
+        font: "skin://fonts/RobotoCondensed-Bold.ttf";
+        shadow: true;
+      });
+
+      widget(label, {
+        filterConstraintX: true;
+        align: center;
+        size: 1.1em;
+        color: 0.8;
+        shadow: true;
+        maxlines: 8;
+        caption: _("Universal Search queries installed online media extensions and plugins.\n\nNotice: It does not index or search local files on USB drives or internal HDD. To browse local files, please use the File Manager on the Home screen.");
+      });
+    });
+
+    space(1);
+  });
 
   widget(container_y, {
     align: top;

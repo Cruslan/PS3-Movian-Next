@@ -164,14 +164,14 @@ make -j$(nproc)
 
 ### Generated Build Deliverables
 
-Upon successful completion, all build artifacts are generated inside `build.ps3/`:
+Upon successful completion, all build artifacts are generated inside `build/`:
 
 | Output File | Description | Target Deployment |
 | :--- | :--- | :--- |
-| `build.ps3/pkg/USRDIR/EBOOT.BIN` | Standalone stripped, relocated & NPDRM signed executable | RPCS3 `dev_hdd0` / USB testing |
-| `build.ps3/movian-next.pkg` | Standard Retail / HEN installable package | PS3 Package Manager (Retail / HEN) |
-| `build.ps3/movian-next_geohot.pkg` | Geohot-signed Custom Firmware package | PS3 Custom Firmware (Evilnat, Rebug, Cobra) |
-| `build.ps3/PARAM.SFO` | Generated application parameter file (`HTSS00004`) | Package metadata descriptor |
+| `build/pkg/USRDIR/EBOOT.BIN` | Standalone stripped, relocated & NPDRM signed executable | RPCS3 `dev_hdd0` / USB testing |
+| `build/movian-next.pkg` | Standard Retail / HEN installable package | PS3 Package Manager (Retail / HEN) |
+| `build/movian-next_geohot.pkg` | Geohot-signed Custom Firmware package | PS3 Custom Firmware (Evilnat, Rebug, Cobra) |
+| `build/PARAM.SFO` | Generated application parameter file (`HTSS00004`) | Package metadata descriptor |
 
 ---
 
@@ -184,10 +184,11 @@ The monolithic build system provides intuitive multi-tier maintenance and clean 
 | `make pkg` | **Default target (`all`).** Compiles C/ASM sources, bundles assets, links executable, signs `EBOOT.BIN`, and builds `.pkg` packages. |
 | `make eboot` | Compiles application code and generates the standalone signed `EBOOT.BIN`. |
 | `make self` | Compiles and generates standard unencrypted `movian.self`. |
+| `make shaders` | Compiles GLSL shaders into RSX vertex/fragment programs (`.vp` / `.fp`) using `cgc` and `cgcomp`. |
 | `make clean` | Safely moves Movian application objects (`src/`, `bundles/`, `pkg/`, `movian*`, `*.o`, `*.d`) to trash while preserving expensive third-party libraries (`ext/`, `libav/`). |
-| `make clean-ext` | Cleans compiled third-party dependencies inside `build.ps3/ext/`. |
+| `make clean-ext` | Cleans compiled third-party dependencies inside `build/ext/`. |
 | `make clean-all` | Combines `clean` and `clean-ext` for a complete application rebuild. |
-| `make distclean` | Safely purges the entire `build.ps3/` directory tree for a 100% clean slate. |
+| `make distclean` | Safely purges the entire `build/` directory tree for a 100% clean slate. |
 | `make prepare` | Downloads and unpacks the official nightly PSL1GHT SDK into `./ps3dev`. |
 
 ---
@@ -199,10 +200,10 @@ Deploy the generated executable directly to the emulator's virtual hard drive:
 
 ```bash
 mkdir -p ~/.config/rpcs3/dev_hdd0/game/HTSS00004/USRDIR
-cp build.ps3/pkg/USRDIR/EBOOT.BIN ~/.config/rpcs3/dev_hdd0/game/HTSS00004/USRDIR/
+cp build/pkg/USRDIR/EBOOT.BIN ~/.config/rpcs3/dev_hdd0/game/HTSS00004/USRDIR/
 ```
 
-Alternatively, drag and drop `build.ps3/movian-next.pkg` directly into the RPCS3 main window.
+Alternatively, drag and drop `build/movian-next.pkg` directly into the RPCS3 main window.
 
 ### 2. Physical PlayStation 3 Hardware (CFW & PS3HEN)
 1. Copy `movian-next.pkg` (or `movian-next_geohot.pkg` for CFW systems) to the root directory of a FAT32 or exFAT USB flash drive.

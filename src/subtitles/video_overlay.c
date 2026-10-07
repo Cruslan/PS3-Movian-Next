@@ -96,8 +96,13 @@ video_subtitles_lavc(media_pipe_t *mp, media_buf_t *mb,
 		  break;
 		}
 
-		const uint8_t *src = r->pict.data[0];
-		const uint32_t *clut = (uint32_t *)r->pict.data[1];
+		/*
+		 * In modern FFmpeg, AVPicture was completely removed and AVSubtitleRect
+		 * defines data[4] and linesize[4] directly at the struct root.
+		 * data[0] contains the paletted bitmap indices and data[1] holds the 32-bit CLUT.
+		 */
+		const uint8_t *src = r->data[0];
+		const uint32_t *clut = (uint32_t *)r->data[1];
 
 		for(y = 0; y < r->h; y++) {
 		  uint32_t *dst = (uint32_t *)(vo->vo_pixmap->pm_data +
@@ -105,7 +110,7 @@ video_subtitles_lavc(media_pipe_t *mp, media_buf_t *mb,
 		  for(x = 0; x < r->w; x++)
 			*dst++ = clut[src[x]];
 
-		  src += r->pict.linesize[0];
+		  src += r->linesize[0];
 		}
 		video_overlay_enqueue(mp, vo);
 		break;

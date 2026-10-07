@@ -28,7 +28,7 @@ delta($ui.fullwindow, isVisible());
 delta($ui.disableScreensaver, $self.media.playstatus == "play");
 
 $self.directClose = 1;
-$self.close = $self.media.playstatus == "stop";
+$self.close = $self.media.playstatus == "stop" && !$self.media.loading;
 $self.model.loading = $self.media.loading;
 $self.model.io <- $self.media.io;
 

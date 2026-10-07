@@ -105,7 +105,7 @@ static const struct {
   { "video/mp4", "mp4" },
   { "video/x-msvideo", "avi" },
   { "video/MP2T", "mpegts" },
-  { "video/mpeg", "mpegts" },
+  { "video/mpeg", "mpeg" },
   { "video/vnd.dlna.mpeg-tts", "mpegts" },
   { "video/avi", "avi" },
   { "video/nsv", "nsv" },
@@ -124,6 +124,17 @@ static const struct {
   { "audio/eac3", "eac3" },
   { "audio/flac", "flac" },
   { "audio/x-flac", "flac" },
+  { "video/x-m2v", "mpegvideo" },
+  { "video/m2v", "mpegvideo" },
+  { "video/mpegvideo", "mpegvideo" },
+  { "video/x-h264", "h264" },
+  { "audio/mlp", "mlp" },
+  { "audio/x-mlp", "mlp" },
+  { "video/av1", "av1" },
+  { "video/x-av1", "av1" },
+  { "video/x-ivf", "ivf" },
+  { "video/x-dv", "dv" },
+  { "video/dv", "dv" },
 };
 
 
@@ -135,7 +146,7 @@ fa_libav_open_format(AVIOContext *avio, const char *url,
 		     char *errbuf, size_t errlen, const char *mimetype,
                      int strategy)
 {
-  AVInputFormat *fmt = NULL;
+  const AVInputFormat *fmt = NULL;
   AVFormatContext *fctx;
   int err;
 
@@ -157,7 +168,8 @@ fa_libav_open_format(AVIOContext *avio, const char *url,
   /*
    * Extension-based format fallback if MIME lookup was ambiguous or absent.
    * Direct format detection completely bypasses syncword scanning ambiguities
-   * (e.g. distinguishing raw DTS from spurious MP3 syncwords).
+   * (e.g. distinguishing raw DTS from spurious MP3 syncwords, or raw MPEG-2/H.264
+   * elementary streams like .m2v and raw MLP audio lacking container wrappers).
    */
   if(fmt == NULL && url != NULL) {
     const char *ext = strrchr(url, '.');
@@ -168,6 +180,24 @@ fa_libav_open_format(AVIOContext *avio, const char *url,
         fmt = av_find_input_format("ac3");
       } else if(!strcasecmp(ext, ".eac3")) {
         fmt = av_find_input_format("eac3");
+      } else if(!strcasecmp(ext, ".m2v") || !strcasecmp(ext, ".m1v") || !strcasecmp(ext, ".mpv")) {
+        fmt = av_find_input_format("mpegvideo");
+      } else if(!strcasecmp(ext, ".h264") || !strcasecmp(ext, ".264")) {
+        fmt = av_find_input_format("h264");
+      } else if(!strcasecmp(ext, ".hevc") || !strcasecmp(ext, ".h265") || !strcasecmp(ext, ".265")) {
+        fmt = av_find_input_format("hevc");
+      } else if(!strcasecmp(ext, ".mlp")) {
+        fmt = av_find_input_format("mlp");
+      } else if(!strcasecmp(ext, ".thd") || !strcasecmp(ext, ".truehd")) {
+        fmt = av_find_input_format("truehd");
+      } else if(!strcasecmp(ext, ".vc1")) {
+        fmt = av_find_input_format("vc1");
+      } else if(!strcasecmp(ext, ".av1")) {
+        fmt = av_find_input_format("av1");
+      } else if(!strcasecmp(ext, ".ivf")) {
+        fmt = av_find_input_format("ivf");
+      } else if(!strcasecmp(ext, ".dv") || !strcasecmp(ext, ".dif")) {
+        fmt = av_find_input_format("dv");
       }
     }
   }
@@ -211,6 +241,7 @@ fa_libav_open_format(AVIOContext *avio, const char *url,
   fctx = avformat_alloc_context();
   fctx->pb = avio;
 
+  TRACE(TRACE_DEBUG, "libav", "%s: Opening format via avformat_open_input...", url);
   if((err = avformat_open_input(&fctx, url, fmt, NULL)) != 0) {
     if(mimetype != NULL) {
       TRACE(TRACE_DEBUG, "libav",
@@ -223,18 +254,44 @@ fa_libav_open_format(AVIOContext *avio, const char *url,
 			       "Unable to open file as input format", err);
   }
 
+  /*
+   * On PS3, seeking repeatedly to the tail of MPEG-PS / MPEG-TS files to estimate duration
+   * from PTS causes massive I/O churn, high latency, and playback start deadlocks.
+   * Skip duration calculation from PTS in estimate_timings_from_pts.
+   */
+  fctx->skip_estimate_duration_from_pts = 1;
+
   switch(strategy) {
   case FA_LIBAV_OPEN_STRATEGY_AUDIO:
     fctx->fps_probe_size = 0;
     fctx->max_analyze_duration = 0;
     break;
   case FA_LIBAV_OPEN_STRATEGY_VIDEO_NON_SEEKABLE:
-    fctx->fps_probe_size = 2;
+    fctx->fps_probe_size = 0;
     fctx->max_analyze_duration = 1;
+    break;
+  case FA_LIBAV_OPEN_STRATEGY_VIDEO_SEEKABLE:
+    fctx->fps_probe_size = 0;
+    fctx->max_analyze_duration = 500000;
+    fctx->probesize = 524288;
+    break;
+  case FA_LIBAV_OPEN_STRATEGY_THUMBNAIL:
+    fctx->fps_probe_size = 2;
+    fctx->max_analyze_duration = 500000;
+    fctx->probesize = 131072;
+    break;
+  case FA_LIBAV_OPEN_STRATEGY_PROBE:
+    fctx->fps_probe_size = 0;
+    fctx->max_analyze_duration = 500000;
+    fctx->probesize = 524288;
+    fctx->flags |= AVFMT_FLAG_FAST_SEEK;
     break;
   }
 
-  if(avformat_find_stream_info(fctx, NULL) < 0) {
+  TRACE(TRACE_DEBUG, "libav", "%s: Finding stream info (format=%s, nb_streams=%d)...",
+        url, fctx->iformat->name, fctx->nb_streams);
+
+  if((err = avformat_find_stream_info(fctx, NULL)) < 0) {
     avformat_close_input(&fctx);
     if(mimetype != NULL) {
       TRACE(TRACE_DEBUG, "libav",
@@ -246,6 +303,9 @@ fa_libav_open_format(AVIOContext *avio, const char *url,
     return fa_libav_open_error(errbuf, errlen,
 			       "Unable to handle file contents", err);
   }
+
+  TRACE(TRACE_DEBUG, "libav", "%s: Found stream info (nb_streams=%d, duration=%"PRId64")",
+        url, fctx->nb_streams, fctx->duration);
 
   return fctx;
 }

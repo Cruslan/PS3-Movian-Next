@@ -215,7 +215,7 @@ extern int hts_cond_wait_timeoutx(hts_cond_t *c, hts_mutex_t *m, int delay, cons
 typedef sys_ppu_thread_t hts_thread_t;
 
 #define THREAD_PRIO_AUDIO          10
-#define THREAD_PRIO_VDEC           1400
+#define THREAD_PRIO_VDEC           1000
 #define THREAD_PRIO_VIDEO          1500
 #define THREAD_PRIO_DEMUXER        2000
 #define THREAD_PRIO_UI_WORKER_HIGH 2100

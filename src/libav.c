@@ -63,14 +63,18 @@ libav_deliver_frame(video_decoder_t *vd,
   /* Compute aspect ratio */
   switch(mbm->mbm_aspect_override) {
   case 0:
+  default:
 
     fi.fi_dar_num = frame->width;
     fi.fi_dar_den = frame->height;
 
-    if(frame->sample_aspect_ratio.num) {
+    if(frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0) {
       fi.fi_dar_num *= frame->sample_aspect_ratio.num;
       fi.fi_dar_den *= frame->sample_aspect_ratio.den;
-    } else if(mc->sar_num) {
+    } else if(ctx->sample_aspect_ratio.num > 0 && ctx->sample_aspect_ratio.den > 0) {
+      fi.fi_dar_num *= ctx->sample_aspect_ratio.num;
+      fi.fi_dar_den *= ctx->sample_aspect_ratio.den;
+    } else if(mc->sar_num > 0 && mc->sar_den > 0) {
       fi.fi_dar_num *= mc->sar_num;
       fi.fi_dar_den *= mc->sar_den;
     }
@@ -84,6 +88,11 @@ libav_deliver_frame(video_decoder_t *vd,
     fi.fi_dar_num = 16;
     fi.fi_dar_den = 9;
     break;
+  }
+
+  if(fi.fi_dar_num <= 0 || fi.fi_dar_den <= 0) {
+    fi.fi_dar_num = frame->width ? frame->width : 16;
+    fi.fi_dar_den = frame->height ? frame->height : 9;
   }
 
   int64_t pts = video_decoder_infer_pts(mbm, vd,
@@ -154,8 +163,9 @@ libav_deliver_frame(video_decoder_t *vd,
                             mbm->mbm_skip,
                             "VOUT");
 
+  /* In modern FFmpeg, interlacing and field parity flags are encapsulated within frame->flags */
   vd->vd_interlaced |=
-    frame->interlaced_frame && !mbm->mbm_disable_deinterlacer;
+    ((frame->flags & AV_FRAME_FLAG_INTERLACED) != 0) && !mbm->mbm_disable_deinterlacer;
 
   fi.fi_width = frame->width;
   fi.fi_height = frame->height;
@@ -166,7 +176,7 @@ libav_deliver_frame(video_decoder_t *vd,
   fi.fi_drive_clock = mbm->mbm_drive_clock;
 
   fi.fi_interlaced = !!vd->vd_interlaced;
-  fi.fi_tff = !!frame->top_field_first;
+  fi.fi_tff = !!(frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST);
   fi.fi_prescaled = 0;
 
   fi.fi_color_space = 
@@ -222,15 +232,21 @@ libav_deliver_frame(video_decoder_t *vd,
 
   if(vd->vd_convert_width  != frame->width  ||
      vd->vd_convert_height != frame->height ||
-     vd->vd_convert_pixfmt != frame->format) {
-    avpicture_free(&vd->vd_convert);
+     vd->vd_convert_pixfmt != frame->format ||
+     vd->vd_convert_frame == NULL) {
+    if(vd->vd_convert_frame != NULL) {
+      av_frame_free(&vd->vd_convert_frame);
+    }
 
     vd->vd_convert_width  = frame->width;
     vd->vd_convert_height = frame->height;
     vd->vd_convert_pixfmt = frame->format;
 
-    avpicture_alloc(&vd->vd_convert, AV_PIX_FMT_YUV420P, frame->width,
-                    frame->height);
+    vd->vd_convert_frame = av_frame_alloc();
+    vd->vd_convert_frame->format = AV_PIX_FMT_YUV420P;
+    vd->vd_convert_frame->width  = frame->width;
+    vd->vd_convert_frame->height = frame->height;
+    av_frame_get_buffer(vd->vd_convert_frame, 32);
 
     TRACE(TRACE_DEBUG, "Video", "Converting from %s to %s",
 	  av_get_pix_fmt_name(frame->format),
@@ -238,15 +254,15 @@ libav_deliver_frame(video_decoder_t *vd,
   }
 
   sws_scale(vd->vd_sws, (void *)frame->data, frame->linesize, 0,
-            frame->height, vd->vd_convert.data, vd->vd_convert.linesize);
+            frame->height, vd->vd_convert_frame->data, vd->vd_convert_frame->linesize);
 
-  fi.fi_data[0] = vd->vd_convert.data[0];
-  fi.fi_data[1] = vd->vd_convert.data[1];
-  fi.fi_data[2] = vd->vd_convert.data[2];
+  fi.fi_data[0] = vd->vd_convert_frame->data[0];
+  fi.fi_data[1] = vd->vd_convert_frame->data[1];
+  fi.fi_data[2] = vd->vd_convert_frame->data[2];
 
-  fi.fi_pitch[0] = vd->vd_convert.linesize[0];
-  fi.fi_pitch[1] = vd->vd_convert.linesize[1];
-  fi.fi_pitch[2] = vd->vd_convert.linesize[2];
+  fi.fi_pitch[0] = vd->vd_convert_frame->linesize[0];
+  fi.fi_pitch[1] = vd->vd_convert_frame->linesize[1];
+  fi.fi_pitch[2] = vd->vd_convert_frame->linesize[2];
 
   fi.fi_type = 'LAVC';
   fi.fi_pix_fmt = AV_PIX_FMT_YUV420P;
@@ -259,75 +275,98 @@ libav_deliver_frame(video_decoder_t *vd,
 /**
  *
  */
+/**
+ * Flushes internal decoder buffers and queues.
+ *
+ * In modern FFmpeg (FFmpeg 3.1+ / 9.0), avcodec_flush_buffers() cleanly resets
+ * the internal codec state, dropping all pending B-frames and picture queues.
+ *
+ * @param mc Pointer to the media codec wrapper.
+ * @param vd Pointer to the video decoder state machine.
+ */
 static void
 libav_video_flush(media_codec_t *mc, video_decoder_t *vd)
 {
-  int got_pic = 0;
   AVCodecContext *ctx = mc->ctx;
-  AVFrame *frame = vd->vd_frame;
-  AVPacket avpkt;
-
-  av_init_packet(&avpkt);
-  avpkt.data = NULL;
-  avpkt.size = 0;
-
-  while(1) {
-    avcodec_decode_video2(ctx, vd->vd_frame, &got_pic, &avpkt);
-    if(!got_pic)
-      break;
-    av_frame_unref(frame);
-  };
-  avcodec_flush_buffers(ctx);
+  if(ctx != NULL) {
+    avcodec_flush_buffers(ctx);
+  }
 }
 
 
 /**
+ * Drains all delayed/buffered frames from the decoder at end-of-stream or discontinuity.
  *
+ * In modern FFmpeg, passing a NULL packet (or sending a NULL packet via avcodec_send_packet)
+ * enters the draining state. We then repeatedly invoke avcodec_receive_frame() until
+ * AVERROR_EOF is returned, ensuring all cached B-frames and delayed reference frames
+ * are presented and displayed.
+ *
+ * @param mc Pointer to the media codec wrapper.
+ * @param vd Pointer to the video decoder state machine.
+ * @param mq Pointer to the media queue receiving metadata updates.
  */
 static void
 libav_video_eof(media_codec_t *mc, video_decoder_t *vd,
                 struct media_queue *mq)
 {
-  int got_pic = 0;
   media_pipe_t *mp = vd->vd_mp;
   AVCodecContext *ctx = mc->ctx;
   AVFrame *frame = vd->vd_frame;
-  AVPacket avpkt;
   int t;
 
-  av_init_packet(&avpkt);
-  avpkt.data = NULL;
-  avpkt.size = 0;
+  if(ctx == NULL)
+    return;
+
+  /* Enter draining mode by sending a NULL packet */
+  avcodec_send_packet(ctx, NULL);
 
   while(1) {
-
     avgtime_start(&vd->vd_decode_time);
 
-    avcodec_decode_video2(ctx, vd->vd_frame, &got_pic, &avpkt);
+    /* Fetch next available reconstructed frame from the draining queue */
+    int ret = avcodec_receive_frame(ctx, frame);
 
     t = avgtime_stop(&vd->vd_decode_time, mq->mq_prop_decode_avg,
                      mq->mq_prop_decode_peak);
 
-    if(!got_pic)
+    /* Non-zero return indicates either AVERROR_EOF or no more frames available */
+    if(ret != 0)
       break;
-    const media_buf_meta_t *mbm = &vd->vd_reorder[frame->reordered_opaque];
+
+    /* In modern FFmpeg, pkt->opaque is copied to frame->opaque under AV_CODEC_FLAG_COPY_OPAQUE */
+    uintptr_t reorder_idx = ((uintptr_t)frame->opaque) & VIDEO_DECODER_REORDER_MASK;
+    const media_buf_meta_t *mbm = &vd->vd_reorder[reorder_idx];
     if(!mbm->mbm_skip)
       libav_deliver_frame(vd, mp, mq, ctx, frame, mbm, t, mc);
+
     av_frame_unref(frame);
-  };
+  }
+
+  /* Reset codec state after complete draining */
   avcodec_flush_buffers(ctx);
 }
 
 #include "misc/minmax.h"
 
 /**
+ * Decodes compressed video packets into raw reconstructed frames using modern FFmpeg send/receive API.
  *
+ * Modern FFmpeg completely eliminated avcodec_decode_video2() in favor of the decoupled
+ * avcodec_send_packet() and avcodec_receive_frame() state machine.
+ * A single input packet may yield 0, 1, or multiple video frames (or none if the packet
+ * is consumed purely as a reference frame).
+ *
+ * @param mc Pointer to the media codec wrapper.
+ * @param vd Pointer to the video decoder state machine.
+ * @param mq Pointer to the media queue for timing telemetry.
+ * @param mb Pointer to the incoming media buffer holding compressed bitstream data.
+ * @param reqsize Unused requested buffer size parameter.
  */
 static void
 libav_decode_video(struct media_codec *mc, struct video_decoder *vd,
                    struct media_queue *mq, struct media_buf *mb, int reqsize)
 {
-  int got_pic = 0;
   media_pipe_t *mp = vd->vd_mp;
   AVCodecContext *ctx = mc->ctx;
   AVFrame *frame = vd->vd_frame;
@@ -336,30 +375,71 @@ libav_decode_video(struct media_codec *mc, struct video_decoder *vd,
   if(mb->mb_flush)
     libav_video_eof(mc, vd, mq);
 
+  /* Preserve reorder index across the circular reorder queue */
   copy_mbm_from_mb(&vd->vd_reorder[vd->vd_reorder_ptr], mb);
-  ctx->reordered_opaque = vd->vd_reorder_ptr;
+  /* In modern FFmpeg, attach reorder index to packet opaque; propagated to frame->opaque under AV_CODEC_FLAG_COPY_OPAQUE */
+  mb->mb_pkt.opaque = (void *)(uintptr_t)vd->vd_reorder_ptr;
   vd->vd_reorder_ptr = (vd->vd_reorder_ptr + 1) & VIDEO_DECODER_REORDER_MASK;
 
   /*
-   * If we are seeking, drop any non-reference frames
+   * If seeking, instruct the decoder to discard non-reference frames to accelerate keyframe seeking
    */
   ctx->skip_frame = mb->mb_skip == 1 ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
   avgtime_start(&vd->vd_decode_time);
 
-  avcodec_decode_video2(ctx, frame, &got_pic, &mb->mb_pkt);
+  /* Send packet to decoder */
+  int ret = avcodec_send_packet(ctx, &mb->mb_pkt);
+  if(ret == AVERROR(EAGAIN)) {
+    /*
+     * Decoder internal input queue is saturated. Drain available decoded frames
+     * first to free internal decoder slots, then retry packet submission.
+     */
+    while(1) {
+      ret = avcodec_receive_frame(ctx, frame);
+      t = avgtime_stop(&vd->vd_decode_time, mq->mq_prop_decode_avg,
+                       mq->mq_prop_decode_peak);
+      if(ret != 0)
+        break;
 
-  t = avgtime_stop(&vd->vd_decode_time, mq->mq_prop_decode_avg,
-		   mq->mq_prop_decode_peak);
+      mp_set_mq_meta(mq, ctx->codec, ctx);
 
-  mp_set_mq_meta(mq, ctx->codec, ctx);
+      uintptr_t reorder_idx = ((uintptr_t)frame->opaque) & VIDEO_DECODER_REORDER_MASK;
+      const media_buf_meta_t *mbm = &vd->vd_reorder[reorder_idx];
+      if(!mbm->mbm_skip)
+        libav_deliver_frame(vd, mp, mq, ctx, frame, mbm, t, mc);
 
-  if(got_pic == 0)
+      av_frame_unref(frame);
+      avgtime_start(&vd->vd_decode_time);
+    }
+    ret = avcodec_send_packet(ctx, &mb->mb_pkt);
+  }
+
+  if(ret < 0 && ret != AVERROR_EOF) {
+    avgtime_stop(&vd->vd_decode_time, mq->mq_prop_decode_avg, mq->mq_prop_decode_peak);
     return;
+  }
 
-  const media_buf_meta_t *mbm = &vd->vd_reorder[frame->reordered_opaque];
-  if(!mbm->mbm_skip)
-    libav_deliver_frame(vd, mp, mq, ctx, frame, mbm, t, mc);
-  av_frame_unref(frame);
+  /* Receive all decoded frames resulting from this packet */
+  while(1) {
+    ret = avcodec_receive_frame(ctx, frame);
+    t = avgtime_stop(&vd->vd_decode_time, mq->mq_prop_decode_avg,
+		     mq->mq_prop_decode_peak);
+
+    if(ret != 0)
+      break;
+
+    mp_set_mq_meta(mq, ctx->codec, ctx);
+
+    uintptr_t reorder_idx = ((uintptr_t)frame->opaque) & VIDEO_DECODER_REORDER_MASK;
+    const media_buf_meta_t *mbm = &vd->vd_reorder[reorder_idx];
+    if(!mbm->mbm_skip)
+      libav_deliver_frame(vd, mp, mq, ctx, frame, mbm, t, mc);
+
+    av_frame_unref(frame);
+
+    /* Restart timer for next potential frame in this packet */
+    avgtime_start(&vd->vd_decode_time);
+  }
 }
 
 
@@ -407,52 +487,36 @@ media_codec_create_lavc(media_codec_t *cw, const media_codec_params_t *mcp,
   if(codec == NULL)
     return -1;
 
-#if defined(PLATFORM_PS3) || defined(__PPU__) || defined(PS3)
-  /**
-   * PlayStation 3 Cell PPE Software Video Decoding Policy:
-   * The Cell Broadband Engine PPU is an in-order dual-issue PowerPC core with strictly
-   * constrained single-thread compute capabilities and only 256MB system memory.
-   * Software decoding of next-generation video codecs (HEVC/H.265, VP9, AV1)
-   * causes extreme CPU thread starvation, high branch misprediction penalties on the
-   * in-order 2-issue Cell PPE, and unbounded heap consumption that can freeze the system.
-   *
-   * On PS3, hardware acceleration via Cell SPUs (ps3_vdec.c) is utilized for MPEG-2
-   * and H.264. Standard SD and 720p legacy/software video formats (MPEG-4 Part 2 /
-   * DivX / XviD, VP8, MJPEG, FLV1, MPEG-1, DV, WMV) are decoded smoothly in software
-   * via libavcodec and rendered via RSX YUVP shaders. Only HEVC, VP9, and AV1 are
-   * rejected here to safeguard system stability.
-   *
-   * Audio codecs (AAC, MP3, AC3, DTS, FLAC, Vorbis, PCM, etc.) remain fully supported
-   * for software decoding on the PPE as their computational overhead is minimal.
-   */
-  if(codec->type == AVMEDIA_TYPE_VIDEO) {
-    if(cw->codec_id == AV_CODEC_ID_HEVC ||
-       cw->codec_id == AV_CODEC_ID_VP9) {
-      TRACE(TRACE_ERROR, "libav",
-            "PS3: Rejecting heavy video codec '%s' (ID %d) to prevent system freeze",
-            codec->name ? codec->name : "<unknown>", cw->codec_id);
-      return -1;
+  cw->ctx = avcodec_alloc_context3(codec);
+  if(cw->fmt_ctx != NULL) {
+    /*
+     * Copy codec parameters from the format context to the decoder context.
+     * Replaces deprecated/removed avcodec_copy_context() via an intermediate AVCodecParameters.
+     */
+    AVCodecParameters *par = avcodec_parameters_alloc();
+    if(par != NULL) {
+      avcodec_parameters_from_context(par, cw->fmt_ctx);
+      avcodec_parameters_to_context(cw->ctx, par);
+      avcodec_parameters_free(&par);
     }
   }
-#endif
-
-  cw->ctx = avcodec_alloc_context3(codec);
-  if(cw->fmt_ctx != NULL)
-    avcodec_copy_context(cw->ctx, cw->fmt_ctx);
 
   // cw->ctx->debug = FF_DEBUG_PICT_INFO | FF_DEBUG_BUGS;
 
   if(mcp != NULL && mcp->extradata != NULL && !cw->ctx->extradata) {
     cw->ctx->extradata = calloc(1, mcp->extradata_size +
-				FF_INPUT_BUFFER_PADDING_SIZE);
+				AV_INPUT_BUFFER_PADDING_SIZE);
     memcpy(cw->ctx->extradata, mcp->extradata, mcp->extradata_size);
     cw->ctx->extradata_size = mcp->extradata_size;
   }
 
   if(mcp && mcp->cheat_for_speed)
-    cw->ctx->flags2 |= CODEC_FLAG2_FAST;
+    cw->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
   if(codec->type == AVMEDIA_TYPE_VIDEO) {
+
+    /* Enable automatic copying of pkt->opaque into decoded frame->opaque in modern FFmpeg */
+    cw->ctx->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
 
     cw->get_buffer2 = &avcodec_default_get_buffer2;
 
@@ -472,7 +536,6 @@ media_codec_create_lavc(media_codec_t *cw, const media_codec_params_t *mcp,
 #endif
 
     cw->ctx->opaque = cw;
-    cw->ctx->refcounted_frames = 1;
     cw->ctx->get_format = &libav_get_format;
     cw->ctx->get_buffer2 = &get_buffer2_wrapper;
 
@@ -484,7 +547,7 @@ media_codec_create_lavc(media_codec_t *cw, const media_codec_params_t *mcp,
     TRACE(TRACE_INFO, "libav", "Unable to open codec %s",
 	  codec ? codec->name : "<noname>");
 
-    av_freep(&cw->ctx);
+    avcodec_free_context(&cw->ctx);
 
     return -1;
   }
@@ -549,16 +612,16 @@ metadata_from_libav(char *dst, size_t dstlen,
     off += snprintf(dst + off, dstlen - off,
                     "%s%s", off ? " " : "", profile);
 
-  if(codec->id == AV_CODEC_ID_H264 && avctx->level != FF_LEVEL_UNKNOWN)
+  if(codec->id == AV_CODEC_ID_H264 && avctx->level != AV_LEVEL_UNKNOWN)
     off += snprintf(dst + off, dstlen - off,
                     " (Level %d.%d)",
                     avctx->level / 10, avctx->level % 10);
 
   if(avctx->codec_type == AVMEDIA_TYPE_AUDIO) {
-    char buf[64];
+    char buf[64] = {0};
 
-    av_get_channel_layout_string(buf, sizeof(buf), avctx->channels,
-                                 avctx->channel_layout);
+    /* Modern FFmpeg channel layout description */
+    av_channel_layout_describe(&avctx->ch_layout, buf, sizeof(buf));
 
     off += snprintf(dst + off, dstlen - off, ", %d Hz, %s",
 		    avctx->sample_rate, buf);
@@ -574,24 +637,32 @@ metadata_from_libav(char *dst, size_t dstlen,
 }
 
 /**
+ * Updates media queue stream metadata properties for UI display.
  *
+ * @param mq Media queue whose metadata properties are being refreshed.
+ * @param codec Active AVCodec decoder definition.
+ * @param avctx Active AVCodecContext instance containing stream parameters.
  */
 void
 mp_set_mq_meta(media_queue_t *mq, const AVCodec *codec,
 	       const AVCodecContext *avctx)
 {
+  uint64_t layout_mask = (avctx->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) ?
+                         avctx->ch_layout.u.mask : 0;
+  int channels = avctx->ch_layout.nb_channels;
+
   if(mq->mq_meta_codec_id       == codec->id &&
      mq->mq_meta_profile        == avctx->profile &&
-     mq->mq_meta_channels       == avctx->channels &&
-     mq->mq_meta_channel_layout == avctx->channel_layout &&
+     mq->mq_meta_channels       == channels &&
+     mq->mq_meta_channel_layout == layout_mask &&
      mq->mq_meta_width          == avctx->width &&
      mq->mq_meta_height         == avctx->height)
     return;
 
   mq->mq_meta_codec_id       = codec->id;
   mq->mq_meta_profile        = avctx->profile;
-  mq->mq_meta_channels       = avctx->channels;
-  mq->mq_meta_channel_layout = avctx->channel_layout;
+  mq->mq_meta_channels       = channels;
+  mq->mq_meta_channel_layout = layout_mask;
   mq->mq_meta_width          = avctx->width;
   mq->mq_meta_height         = avctx->height;
 

@@ -44,6 +44,8 @@
 #include "video/video_decoder.h"
 #include "video/video_playback.h"
 
+extern s32 rsxContextCallback(gcmContextData *context, u32 count);
+
 
 /**
  * gv_surface_mutex must be held
@@ -120,12 +122,7 @@ yuvp_reset(glw_video_t *gv)
  * Luminance Texture Remap Macro:
  * Replicates single byte component into all shader vector channels (R, G, B, A).
  */
-#define REMAP_L8 \
-  GCM_TEXTURE_REMAP_MODE(GCM_TEXTURE_REMAP_ORDER_XYXY, \
-                         GCM_TEXTURE_REMAP_COLOR_B, GCM_TEXTURE_REMAP_COLOR_B, \
-                         GCM_TEXTURE_REMAP_COLOR_B, GCM_TEXTURE_REMAP_COLOR_B, \
-                         GCM_TEXTURE_REMAP_TYPE_REMAP, GCM_TEXTURE_REMAP_TYPE_REMAP, \
-                         GCM_TEXTURE_REMAP_TYPE_REMAP, GCM_TEXTURE_REMAP_TYPE_REMAP)
+#define REMAP_L8 0xaaff
 
 /**
  * @brief Configures an 8-bit planar YUV component texture descriptor.
@@ -168,17 +165,22 @@ static void
 surface_init(glw_video_t *gv, glw_video_surface_t *gvs)
 {
   int i;
+  int pitch[3];
   int siz[3];
 
   /* First release any previous RSX allocation for this surface descriptor */
   surface_reset(gv, gvs);
 
-  /* Compute byte size for Y, U, and V planar buffers aligned to 16-byte boundaries */
-  for(i = 0; i < 3; i++)
-    siz[i] = ROUND_UP(gvs->gvs_width[i] * gvs->gvs_height[i], 16);
+  /* Compute scanline pitch padded to 64-byte alignment required by RSX linear texture sampling.
+   * NV40/G70 linear texture fetch pipelines require row strides to be 64-byte aligned to prevent
+   * cache bank conflicts and diagonal sampling distortion across non-standard resolutions. */
+  for(i = 0; i < 3; i++) {
+    pitch[i] = ROUND_UP(gvs->gvs_width[i], 64);
+    siz[i] = ROUND_UP(pitch[i] * gvs->gvs_height[i], 64);
+  }
 
   gvs->gvs_size = siz[0] + siz[1] + siz[2];
-  gvs->gvs_offset = rsx_alloc(gvs->gvs_size, 16);
+  gvs->gvs_offset = rsx_alloc(gvs->gvs_size, 64);
 
   /* Guard against VRAM allocation failure (e.g. low memory or high fragment pool exhaustion) */
   if(gvs->gvs_offset <= 0) {
@@ -204,7 +206,7 @@ surface_init(glw_video_t *gv, glw_video_surface_t *gvs)
              offset,
              gvs->gvs_width[i],
              gvs->gvs_height[i],
-             gvs->gvs_width[i]);
+             pitch[i]);
     offset += siz[i];
   }
 }
@@ -270,13 +272,66 @@ glw_video_rsx_load_uniforms(glw_root_t *gr, glw_program_t *gp, void *args,
 static inline void
 rsx_bind_video_texture(gcmContextData *ctx, int unit, const gcmTexture *tex)
 {
-  rsxLoadTexture(ctx, (u8)unit, tex);
-  /* Configure single base mipmap level without out-of-bounds LOD fetching */
-  rsxTextureControl(ctx, (u8)unit, GCM_TRUE, 0, 0, GCM_TEXTURE_MAX_ANISO_1);
-  /* Linear video plane filtering without convolution */
-  rsxTextureFilter(ctx, (u8)unit, 0, GCM_TEXTURE_LINEAR, GCM_TEXTURE_LINEAR, 0);
-  rsxTextureWrapMode(ctx, (u8)unit, GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE,
-                     GCM_TEXTURE_CLAMP_TO_EDGE, 0, GCM_TEXTURE_ZFUNC_LESS, 0);
+  if(unlikely(tex == NULL || tex->offset == 0))
+    return;
+
+  /* Ensure sufficient contiguous command buffer space (13 words) */
+  if(unlikely(ctx->current + 13 > ctx->end)) {
+    if(rsxContextCallback(ctx, 13) != 0)
+      return;
+  }
+
+  /* 1. Invalidate texture cache to flush any stale GDDR3 lines */
+  *(ctx->current++) = (1 << 18) | NV40TCL_TEX_CACHE_CTL;
+  *(ctx->current++) = GCM_INVALIDATE_TEXTURE;
+
+  /* 2. Format configuration */
+  const uint32_t fmt_id = tex->format & 0x1f;
+  const uint32_t loc_dma = (tex->location == GCM_LOCATION_CELL) ? NV40TCL_TEX_FORMAT_DMA1 : NV40TCL_TEX_FORMAT_DMA0;
+  const uint32_t format = (fmt_id << NV40TCL_TEX_FORMAT_FORMAT_SHIFT) |
+                          NV40TCL_TEX_FORMAT_LINEAR |
+                          NV40TCL_TEX_FORMAT_DIMS_2D |
+                          loc_dma |
+                          NV40TCL_TEX_FORMAT_NO_BORDER |
+                          0x8000 |
+                          (1 << NV40TCL_TEX_FORMAT_MIPMAP_COUNT_SHIFT);
+
+  /* 3. Texture wrap mode: clamp to edge without depth shadow comparison (RCOMP=0) */
+  const uint32_t wrap = NV40TCL_TEX_WRAP_R_REPEAT |
+                        NV40TCL_TEX_WRAP_S_CLAMP_TO_EDGE |
+                        NV40TCL_TEX_WRAP_T_CLAMP_TO_EDGE;
+
+  /* 4. Sampler enable: NV40_3D_TEX_ENABLE_ENABLE (0x80000000) */
+  const uint32_t enable = NV40TCL_TEX_ENABLE_MASK;
+
+  /* 5. Swizzle / component remapping */
+  const uint32_t swizzle = tex->remap;
+
+  /* 6. Filter: linear with quincunx convolution and default bias */
+  const uint32_t filter = NV40TCL_TEX_FILTER_MIN_LINEAR |
+                          NV40TCL_TEX_FILTER_MAG_LINEAR |
+                          0x3fd6;
+
+  /* 7. Texture dimensions */
+  const uint32_t size0 = ((uint32_t)tex->width << 16) | (uint32_t)tex->height;
+
+  /* 8. Border color */
+  const uint32_t borderColor = 0;
+
+  /* Emit atomic 8-register NV40 texture setup block (0x1a00 .. 0x1a1c) */
+  *(ctx->current++) = (8 << 18) | NV40TCL_TEX_OFFSET(unit);
+  *(ctx->current++) = tex->offset;
+  *(ctx->current++) = format;
+  *(ctx->current++) = wrap;
+  *(ctx->current++) = enable;
+  *(ctx->current++) = swizzle;
+  *(ctx->current++) = filter;
+  *(ctx->current++) = size0;
+  *(ctx->current++) = borderColor;
+
+  /* 9. Texture pitch and depth (0x1840 + unit*4) */
+  *(ctx->current++) = (1 << 18) | NV40TCL_TEX_SIZE1(unit);
+  *(ctx->current++) = tex->pitch | (1 << NV40TCL_TEX_SIZE1_DEPTH_SHIFT);
 }
 
 /**
@@ -328,7 +383,7 @@ yuvp_init(glw_video_t *gv)
 
   memset(gv->gv_cmatrix_cur, 0, sizeof(float) * 16);
 
-  /* Cleanly initialize all surface descriptors in the pool */
+  /* Cleanly initialize all surface descriptors in the pool and enqueue all surfaces */
   for(i = 0; i < GLW_VIDEO_MAX_SURFACES; i++) {
     glw_video_surface_t *gvs = &gv->gv_surfaces[i];
     gvs->gvs_offset = 0;
@@ -336,9 +391,8 @@ yuvp_init(glw_video_t *gv)
     gvs->gvs_data[0] = NULL;
     gvs->gvs_data[1] = NULL;
     gvs->gvs_data[2] = NULL;
-    /* Limit the active surface queue pool to 4 to conserve RSX GDDR3 VRAM */
-    if(i < 4)
-      TAILQ_INSERT_TAIL(&gv->gv_avail_queue, gvs, gvs_link);
+    /* Populate all available queue descriptors to prevent decoder pipeline stalls */
+    TAILQ_INSERT_TAIL(&gv->gv_avail_queue, gvs, gvs_link);
   }
   return 0;
 }
@@ -539,13 +593,17 @@ yuvp_deliver(const frame_info_t *fi, glw_video_t *gv, glw_video_engine_t *gve)
       h = hvec[i];
       src = fi->fi_data[i];
       dst = s->gvs_data[i];
+      const uint32_t dpitch = s->gvs_tex[i].pitch;
  
       while(h--) {
 	memcpy(dst, src, w);
-	dst += w;
+	dst += dpitch;
 	src += fi->fi_pitch[i];
       }
     }
+
+    /* Cell PPU memory barrier: ensure written planar pixels are flushed and visible to RSX */
+    __asm__ volatile("sync" ::: "memory");
 
     glw_video_put_surface(gv, s, fi->fi_pts, fi->fi_epoch, fi->fi_duration,
 			  0, 0);
@@ -562,14 +620,17 @@ yuvp_deliver(const frame_info_t *fi, glw_video_t *gv, glw_video_engine_t *gve)
       
       src = fi->fi_data[i]; 
       dst = s->gvs_data[i];
+      const uint32_t dpitch = s->gvs_tex[i].pitch;
       
       while(h--) {
 	memcpy(dst, src, w);
-	dst += w;
+	dst += dpitch;
 	src += fi->fi_pitch[i] * 2;
       }
     }
     
+    __asm__ volatile("sync" ::: "memory");
+
     glw_video_put_surface(gv, s, fi->fi_pts, fi->fi_epoch, duration, 1, !tff);
 
     if((s = glw_video_get_surface(gv, wvec, hvec)) == NULL)
@@ -588,14 +649,17 @@ yuvp_deliver(const frame_info_t *fi, glw_video_t *gv, glw_video_engine_t *gve)
       
       src = fi->fi_data[i] + fi->fi_pitch[i];
       dst = s->gvs_data[i];
+      const uint32_t dpitch = s->gvs_tex[i].pitch;
       
       while(h--) {
 	memcpy(dst, src, w);
-	dst += w;
+	dst += dpitch;
 	src += fi->fi_pitch[i] * 2;
       }
     }
     
+    __asm__ volatile("sync" ::: "memory");
+
     glw_video_put_surface(gv, s, fi->fi_pts + duration,
 			  fi->fi_epoch, duration, 1, tff);
   }

@@ -41,6 +41,16 @@
 
 
 
+/**
+ * Modern FFmpeg compatibility shim for legacy AVPicture structure.
+ * In FFmpeg 5.0+, AVPicture was removed; AVFrame's memory layout
+ * contains data[] and linesize[] at the exact same struct offsets.
+ */
+typedef struct AVPicture {
+  uint8_t *data[AV_NUM_DATA_POINTERS];
+  int linesize[AV_NUM_DATA_POINTERS];
+} AVPicture;
+
 static pixmap_t *pixmap_rescale_swscale(const AVPicture *pict, int src_pix_fmt,
                                         int src_w, int src_h,
                                         int dst_w, int dst_h,
@@ -140,20 +150,20 @@ pixmap_rescale_swscale(const AVPicture *pict, int src_pix_fmt,
    */
   sws = sws_getContext(src_w, src_h, src_pix_fmt, 
 		       dst_w, dst_h, dst_pix_fmt,
-		       SWS_LANCZOS | 
+		       SWS_BILINEAR | SWS_ACCURATE_RND | 
 		       (gconf.enable_image_debug ? SWS_PRINT_INFO : 0),
                        NULL, NULL, NULL);
   if(sws == NULL) {
     sws = sws_getContext(src_w, src_h, src_pix_fmt,
 		         dst_w, dst_h, dst_pix_fmt,
-		         SWS_BILINEAR |
+		         SWS_FAST_BILINEAR |
 		         (gconf.enable_image_debug ? SWS_PRINT_INFO : 0),
                          NULL, NULL, NULL);
   }
   if(sws == NULL) {
     sws = sws_getContext(src_w, src_h, src_pix_fmt,
 		         dst_w, dst_h, dst_pix_fmt,
-		         SWS_FAST_BILINEAR |
+		         SWS_LANCZOS |
 		         (gconf.enable_image_debug ? SWS_PRINT_INFO : 0),
                          NULL, NULL, NULL);
   }
@@ -560,9 +570,9 @@ image_decode_libav(image_coded_type_t type,
                    char *errbuf, size_t errlen)
 {
   AVCodecContext *ctx;
-  AVCodec *codec;
+  const AVCodec *codec;
   AVFrame *frame;
-  int got_pic, w, h;
+  int w, h;
   jpeg_meminfo_t mi;
   jpeginfo_t ji = {0};
 
@@ -626,9 +636,11 @@ image_decode_libav(image_coded_type_t type,
    * pthreads via PSL1GHT's libpthread, preventing synchronization deadlocks.
    */
   ctx->thread_count = 1;
+  ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+  ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
   if(avcodec_open2(ctx, codec, NULL) < 0) {
-    av_free(ctx);
+    avcodec_free_context(&ctx);
     snprintf(errbuf, errlen, "Unable to open codec");
     return NULL;
   }
@@ -639,32 +651,46 @@ image_decode_libav(image_coded_type_t type,
   av_init_packet(&avpkt);
   avpkt.data = (void *)buf_data(buf);
   avpkt.size = buf_size(buf);
-  int r = avcodec_decode_video2(ctx, frame, &got_pic, &avpkt);
 
-  if(r < 0 || ctx->width == 0 || ctx->height == 0) {
+  int got_pic = 0;
+  int r = avcodec_send_packet(ctx, &avpkt);
+  if(r >= 0) {
+    r = avcodec_receive_frame(ctx, frame);
+    if(r == 0) {
+      got_pic = 1;
+    } else if(r == AVERROR(EAGAIN)) {
+      /* Drain/flush decoder in case of delayed frame output */
+      avcodec_send_packet(ctx, NULL);
+      if(avcodec_receive_frame(ctx, frame) == 0) {
+        got_pic = 1;
+      }
+    }
+  }
+
+  /* Extract actual decoded dimensions and pixel format from frame or context */
+  int img_w = frame->width > 0 ? frame->width : (ctx->width > 0 ? ctx->width : ji.ji_width);
+  int img_h = frame->height > 0 ? frame->height : (ctx->height > 0 ? ctx->height : ji.ji_height);
+  int img_fmt = (frame->format != AV_PIX_FMT_NONE) ? frame->format : ctx->pix_fmt;
+
+  if(!got_pic || img_w <= 0 || img_h <= 0 || img_fmt == AV_PIX_FMT_NONE) {
     snprintf(errbuf, errlen, "Unable to decode image of size (%d x %d)",
-             ctx->width, ctx->height);
-    avcodec_close(ctx);
-    av_free(ctx);
+             img_w, img_h);
     av_frame_free(&frame);
+    avcodec_free_context(&ctx);
     return NULL;
   }
 
-#if 0
-  printf("%d x %d => %d x %d (lowres=%d) req = %d x %d%s%s\n",
-	 ji.ji_width, ji.ji_height,
-	 ctx->width, ctx->height, lowres,
-	 im->im_req_width, im->im_req_height,
-	 im->im_want_thumb ? ", want thumb" : "",
-	 pm->pm_flags & PIXMAP_THUMBNAIL ? ", is thumb" : "");
-#endif
+  /* Synchronize context with resolved frame dimensions and format */
+  ctx->width = img_w;
+  ctx->height = img_h;
+  ctx->pix_fmt = img_fmt;
 
-  pixmap_compute_rescale_dim(im, ctx->width, ctx->height, &w, &h);
+  pixmap_compute_rescale_dim(im, img_w, img_h, &w, &h);
 
   pixmap_t *pm;
 
   pm = pixmap_from_avpic((AVPicture *)frame, 
-			 ctx->pix_fmt, ctx->width, ctx->height, w, h, im);
+			 img_fmt, img_w, img_h, w, h, im);
 
   if(pm != NULL) {
     pm->pm_aspect = (float)w / (float)h;
@@ -673,7 +699,6 @@ image_decode_libav(image_coded_type_t type,
   }
   av_frame_free(&frame);
 
-  avcodec_close(ctx);
-  av_free(ctx);
+  avcodec_free_context(&ctx);
   return pm;
 }

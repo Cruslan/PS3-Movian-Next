@@ -18,10 +18,11 @@
 .DEFAULT_GOAL := pkg
 
 C ?= ${CURDIR}
-BUILD ?= ps3
-BUILDDIR ?= ${C}/build.${BUILD}
+BUILDDIR ?= ${C}/build
 
-ifeq ($(wildcard $(CURDIR)/ps3dev),)
+ifneq ($(wildcard /mnt/nvme1n1p1/Build/upstream-sdk/ps3dev),)
+export PS3DEV	?= /mnt/nvme1n1p1/Build/upstream-sdk/ps3dev
+else ifeq ($(wildcard $(CURDIR)/ps3dev),)
 export PS3DEV	?= /usr/local/ps3dev
 else
 export PS3DEV	?= $(CURDIR)/ps3dev
@@ -72,11 +73,14 @@ SFO		:= $(PS3DEV)/bin/sfo
 PKG		:= $(PS3DEV)/bin/pkg
 PACKAGE_FINALIZE:= $(PS3DEV)/bin/package_finalize
 MKBUNDLE	:= $(CURDIR)/support/mkbundle
+CGC		?= $(shell which cgc 2>/dev/null || echo /opt/nvidia-cg-toolkit/bin/cgc)
+CGCOMP		?= $(PS3DEV)/bin/cgcomp
 
 PROG=${BUILDDIR}/movian
 LIB=${BUILDDIR}/libmovian
-OPTFLAGS ?= -mcpu=cell -O2
-ALLDEPS = Makefile $(BUILDDIR)/config.h $(BUILDDIR)/version_git.h
+OPTFLAGS ?= -mcpu=cell -O2 -flto
+OPTFLAGS_O3 ?= -mcpu=cell -O3 -flto
+ALLDEPS = Makefile $(BUILDDIR)/config.h $(BUILDDIR)/version_git.h $(BUILDDIR)/stamps/ffmpeg.stamp
 
 $(BUILDDIR)/config.h: $(CURDIR)/src/config.h
 	@mkdir -p $(dir $@)
@@ -135,6 +139,7 @@ CFLAGS_cfg += -mminimal-toc -DWORDS_BIGENDIAN -fno-strict-aliasing \
 		-DPATH_MAX=512 -DPS3 -D_FILE_OFFSET_BITS=64 -include sys/time.h \
 		-I$(PS3DEV)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I$(PS3DEV)/portlibs/ppu/include/freetype2 \
 		-Wno-format-truncation -Wno-format-overflow \
+		-Wno-stringop-truncation -Wno-stringop-overflow -Wno-array-parameter \
 		-I$(BUILDDIR)/inst/include -DUSE_POLARSSL -Iext/sqlite
 
 SQLITE_PLATFORM_DEFINES += -DSQLITE_OS_OTHER=1
@@ -144,11 +149,11 @@ LDFLAGS_cfg += -Wl,--allow-multiple-definition -lvdec \
 		-L$(PS3DEV)/ppu/lib -L$(PS3DEV)/portlibs/ppu/lib \
 		-lrsx -lgcm_sys -laudio -lsysutil -lio -lnet -lnetctl -lsysmodule \
 		-lfreetype -lrt -lsysbase -llv2 -lm \
-		-L$(BUILDDIR)/inst/lib -lavresample -lswscale -lavformat -lavcodec -lavutil -lz -lm \
+		-L$(BUILDDIR)/inst/lib -lswresample -lswscale -lavformat -lavcodec -lavutil -lz -lm \
 		-lpthread -lrt -lsysbase -llv2 -lm
 
 CFLAGS = ${CFLAGS_std} ${OPTFLAGS}
-LDFLAGS += ${OPTFLAGS}
+LDFLAGS += ${OPTFLAGS} -mminimal-toc -fno-strict-aliasing
 
 
 
@@ -673,7 +678,10 @@ SRCS-$(CONFIG_POLARSSL) += \
 	ext/polarssl-1.3/library/xtea.c \
 
 
-${BUILDDIR}/ext/polarssl-1.3/library/%.o : CFLAGS = -Wall ${OPTFLAGS}
+${BUILDDIR}/ext/polarssl-1.3/library/%.o : CFLAGS = -Wall ${OPTFLAGS_O3}
+${BUILDDIR}/src/image/%.o : CFLAGS = ${CFLAGS_std} ${OPTFLAGS_O3}
+${BUILDDIR}/src/arch/ps3/ps3_audio.o : CFLAGS = ${CFLAGS_std} ${OPTFLAGS_O3}
+${BUILDDIR}/src/arch/ps3/%.o : CFLAGS += -fno-lto
 
 
 ifeq ($(CONFIG_POLARSSL), yes)
@@ -921,6 +929,39 @@ $(GEOHOT_PKG): $(PKG_FILE) Makefile
 pkg: $(PKG_FILE) $(GEOHOT_PKG)
 self: $(SELF)
 eboot: $(EBOOT)
+elf: $(ELF)
+
+.SECONDARY: $(ELF) $(BUNDLE_ELF)
+
+SHADERS_DIR := res/shaders/rsx
+
+RSX_SHADERS = \
+	$(SHADERS_DIR)/v1.vp \
+	$(SHADERS_DIR)/yuv2rgb_v.vp \
+	$(SHADERS_DIR)/f_tex.fp \
+	$(SHADERS_DIR)/f_flat.fp \
+	$(SHADERS_DIR)/f_tex_blur.fp \
+	$(SHADERS_DIR)/f_tex_stencil.fp \
+	$(SHADERS_DIR)/f_flat_stencil.fp \
+	$(SHADERS_DIR)/f_tex_stencil_blur.fp \
+	$(SHADERS_DIR)/yuv2rgb_1f_norm.fp \
+	$(SHADERS_DIR)/yuv2rgb_2f_norm.fp
+
+$(SHADERS_DIR)/%.fp: res/shaders/glsl/%.glsl
+	@mkdir -p $(dir $@) $(BUILDDIR)
+	$(CGC) -oglsl -profile fp40 $< > $(BUILDDIR)/$*.fp40
+	$(CGCOMP) -a -f $(BUILDDIR)/$*.fp40 $@
+	@gio trash $(BUILDDIR)/$*.fp40 2>/dev/null || true
+
+$(SHADERS_DIR)/%.vp: res/shaders/glsl/%.glsl
+	@mkdir -p $(dir $@) $(BUILDDIR)
+	$(CGC) -oglsl -profile vp40 $< > $(BUILDDIR)/$*.vp40
+	$(CGCOMP) -a -v $(BUILDDIR)/$*.vp40 $@
+	@gio trash $(BUILDDIR)/$*.vp40 2>/dev/null || true
+
+shaders: $(RSX_SHADERS)
+	@gio trash $(BUILDDIR)/bundles/res/shaders/rsx.* 2>/dev/null || true
+	@echo "All RSX shaders compiled successfully to $(SHADERS_DIR)/ with cgcomp."
 
 install: $(PKG_FILE)
 	cp $< $(PS3INSTALL)/$(PKGNAME).pkg
@@ -931,6 +972,7 @@ CLEAN_TARGETS = $(BUILDDIR)/src \
 		$(BUILDDIR)/pkg \
 		$(BUILDDIR)/support \
 		$(BUILDDIR)/stamps \
+		$(BUILDDIR)/shaders \
 		$(BUILDDIR)/$(APPNAME) \
 		$(BUILDDIR)/$(APPNAME).* \
 		$(BUILDDIR)/$(PKGNAME).* \
@@ -957,10 +999,12 @@ clean:
 	@echo "Clean completed successfully."
 
 clean-ext:
-	@echo "Cleaning external compiled libraries (ext/)..."
-	@if [ -d "$(BUILDDIR)/ext" ]; then \
-		gio trash "$(BUILDDIR)/ext" 2>/dev/null || kioclient --noninteractive move "$(BUILDDIR)/ext" trash:/ 2>/dev/null || true; \
-	fi
+	@echo "Cleaning external compiled libraries (ext/ and ffmpeg)..."
+	@for d in "$(BUILDDIR)/ext" "$(BUILDDIR)/ffmpeg" "$(BUILDDIR)/stamps"; do \
+		if [ -e "$$d" ]; then \
+			gio trash "$$d" 2>/dev/null || kioclient --noninteractive move "$$d" trash:/ 2>/dev/null || true; \
+		fi; \
+	done
 	@echo "External libraries cleaned successfully."
 
 clean-all: clean clean-ext
@@ -968,7 +1012,7 @@ clean-all: clean clean-ext
 
 distclean:
 	@echo "Cleaning all build directories..."
-	@for d in build.*; do \
+	@for d in build build.*; do \
 		if [ -e "$$d" ]; then \
 			gio trash "$$d" 2>/dev/null || kioclient --noninteractive move "$$d" trash:/ 2>/dev/null || true; \
 		fi; \
@@ -986,7 +1030,7 @@ prepare:
 	@echo "PS3 SDK environment successfully set up in ./ps3dev."
 	@echo "Project is ready to build. Run 'make -j12' to compile."
 
-.PHONY: all pkg self eboot install clean clean-ext clean-all distclean prepare makever build-%
+.PHONY: all pkg self eboot shaders install clean clean-ext clean-all distclean prepare makever build-%
 
 
 src/version.c: ${BUILDDIR}/version_git.h

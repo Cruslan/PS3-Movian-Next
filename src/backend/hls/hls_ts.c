@@ -562,23 +562,29 @@ probe_duration(ts_es_t *te, uint8_t *data, int size)
 
   media_codec_t *mc = te->te_codec;
 
-  AVCodec *codec = avcodec_find_decoder(mc->codec_id);
+  const AVCodec *codec = avcodec_find_decoder(mc->codec_id);
   if(codec == NULL) {
     te->te_probe_frame = 0;
     return;
   }
 
   AVCodecContext *ctx = avcodec_alloc_context3(codec);
+  if(ctx != NULL)
+    ctx->thread_count = 1;
 
   if(avcodec_open2(ctx, codec, NULL) < 0) {
-    av_freep(&ctx);
+    avcodec_free_context(&ctx);
     te->te_probe_frame = 0;
     return;
   }
 
   AVFrame *frame = av_frame_alloc();
 
-  avcodec_decode_audio4(ctx, frame, &got_frame, &pkt);
+  if(avcodec_send_packet(ctx, &pkt) >= 0) {
+    if(avcodec_receive_frame(ctx, frame) == 0) {
+      got_frame = 1;
+    }
+  }
 
   if(got_frame) {
     te->te_probe_frame = 0;
@@ -587,9 +593,7 @@ probe_duration(ts_es_t *te, uint8_t *data, int size)
     te->te_samples = 0;
   }
 
-  avcodec_close(ctx);
-  av_freep(&ctx);
-
+  avcodec_free_context(&ctx);
   av_frame_free(&frame);
 }
 
@@ -854,8 +858,10 @@ process_es(ts_es_t *te, const uint8_t *tsb, ts_demuxer_t *td, hls_segment_t *hs)
 
 
   if(pusi) {
-    if(te->te_buf != NULL)
-      memset(te->te_buf + te->te_packet_size, 0, FF_INPUT_BUFFER_PADDING_SIZE);
+    if(te->te_buf != NULL) {
+      /* Zero out trailing buffer padding to prevent parser over-reads across bitstream packet boundaries */
+      memset(te->te_buf + te->te_packet_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    }
     emit_packet(te, td, hs);
     te->te_packet_size = 0;
     te->te_current_seq = hs->hs_seq;
@@ -863,8 +869,9 @@ process_es(ts_es_t *te, const uint8_t *tsb, ts_demuxer_t *td, hls_segment_t *hs)
 
   if(te->te_packet_size + size > te->te_buf_size) {
     te->te_buf_size = te->te_buf_size * 2 + size;
+    /* Allocate extra safety padding required by FFmpeg SIMD bitstream readers */
     te->te_buf = myreallocf(te->te_buf,
-                            te->te_buf_size + FF_INPUT_BUFFER_PADDING_SIZE);
+                            te->te_buf_size + AV_INPUT_BUFFER_PADDING_SIZE);
     if(te->te_buf == NULL) {
       te->te_buf_size = 0;
       return;

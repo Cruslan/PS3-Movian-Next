@@ -33,6 +33,7 @@
 #include "media/media.h"
 #include "video/video_playback.h"
 #include "usage.h"
+#include "notifications.h"
 
 // http://www.bittorrent.org/beps/bep_0009.htm
 
@@ -71,6 +72,13 @@ torrent_open_url(const char **urlp, char *errbuf, size_t errlen)
   const char *url = *urlp;
 
   hts_mutex_lock(&bittorrent_mutex);
+
+  /* Guard against opening torrent resources when BitTorrent is disabled in settings */
+  if(!btg.btg_enabled) {
+    hts_mutex_unlock(&bittorrent_mutex);
+    snprintf(errbuf, errlen, "BitTorrent is disabled in Network settings");
+    return NULL;
+  }
 
   if(hex2binl(infohash, 20, url, 40) == 20 &&
      (url[40] == '/' || url[40] == 0)) {
@@ -263,6 +271,13 @@ bt_open(prop_t *page, const char *url, int sync)
 {
   const char *u;
 
+  /* Check if BitTorrent engine is enabled in settings */
+  if(!btg.btg_enabled) {
+    notify_add(NULL, NOTIFY_WARNING, NULL, 5,
+               _("BitTorrent is disabled in Network settings"));
+    return -1;
+  }
+
   if((u = mystrbegins(url, "torrent:video:")) != NULL) {
     return torrent_movie_open(page, u, sync);
   } else if((u = mystrbegins(url, "torrent:browse:")) != NULL) {
@@ -292,6 +307,11 @@ bt_playvideo(const char *url, media_pipe_t *mp,
              const video_args_t *va0)
 {
   const char *u;
+
+  if(!btg.btg_enabled) {
+    snprintf(errbuf, errlen, "BitTorrent is disabled in Network settings");
+    return NULL;
+  }
 
   if((u = mystrbegins(url, "torrent:video:")) != NULL) {
 

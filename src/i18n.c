@@ -186,18 +186,33 @@ i18n_init(void)
 
 
 /**
+ * @brief Computes a priority score for a given ISO language code against user preferences.
  *
+ * Scans the user-configured language preference array (top 3 preferences) to determine
+ * if the candidate stream language matches. Higher scores correspond to higher priority.
+ *
+ * @param[in] str Candidate ISO language code string.
+ * @param[in] vec Array of 3 four-byte character buffers storing configured language codes.
+ * @return Priority score (300,000 for 1st preference, 200,000 for 2nd, 100,000 for 3rd, or 0 if unmatched).
+ *
+ * @complexity O(1) time complexity (fixed loop over 3 elements), O(1) space complexity.
  */
 static int
 findscore(const char *str, char vec[][4])
 {
   int i;
+
+  /* Return score 0 immediately if input language code is NULL or empty string */
   if(str == NULL || *str == 0)
     return 0;
 
-  for(i = 0; i < 3; i++)
-    if(vec[i] && !strcasecmp(vec[i], str))
+  /* Iterate through the three prioritized language slots */
+  for(i = 0; i < 3; i++) {
+    /* Verify slot contains a non-empty language string and matches case-insensitively */
+    if(vec[i][0] != '\0' && !strcasecmp(vec[i], str))
       return 100000 * (3 - i);
+  }
+
   return 0;
 }
 

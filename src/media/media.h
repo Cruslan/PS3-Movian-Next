@@ -380,6 +380,9 @@ typedef struct media_pipe {
   int64_t mp_reset_time;
   int mp_reset_epoch;
 
+  hts_thread_t mp_player_thread;
+  int mp_player_thread_valid;
+
 } media_pipe_t;
 
 extern void (*media_pipe_init_extra)(media_pipe_t *mp);

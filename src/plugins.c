@@ -851,13 +851,17 @@ repo_get(const char *repo, char *errbuf, size_t errlen)
 static int
 plugin_load_repo(void)
 {
+  const char *rurl = repo_url();
+  if(rurl == NULL || *rurl == 0)
+    return 0;
+
   plugin_t *pl, *next;
   char errbuf[512];
-  htsmsg_t *msg = repo_get(repo_url(), errbuf, sizeof(errbuf));
+  htsmsg_t *msg = repo_get(rurl, errbuf, sizeof(errbuf));
 
   if(msg == REPO_ERROR_NETWORK || msg == NULL) {
     TRACE(TRACE_ERROR, "plugins", "Unable to load repo %s -- %s",
-	  repo_url(), errbuf);
+	  rurl, errbuf);
     return msg == REPO_ERROR_NETWORK ? -1 : 0;
   }
 

@@ -2030,7 +2030,8 @@ metadata_thread(void *aux)
 static void
 metadata_threads_start(void)
 {
-  if(metadata_num_threads >= 4)
+  /* Allow up to 2 background threads on PS3 Cell PPE to overlap disk I/O latency */
+  if(metadata_num_threads >= 2)
     return;
   metadata_num_threads++;
   hts_thread_create_detached("metadata", metadata_thread, NULL,

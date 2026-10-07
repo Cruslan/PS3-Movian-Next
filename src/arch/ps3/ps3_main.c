@@ -212,16 +212,20 @@ memlogger_fn(callout_t *co, void *aux)
   Lv2Syscall2(383, 1, (uint64_t)&temp); // RSX temp
   prop_set(tempprop, "gpu", PROP_SET_INT, temp >> 24);
 
-  uint64_t size, avail;
+  /* Throttle physical HDD filesystem querying to every 10 seconds to eliminate disk I/O latency stalls */
+  static int hdd_poll_counter = 0;
+  if(++hdd_poll_counter >= 10) {
+    hdd_poll_counter = 0;
+    uint64_t size, avail;
+    int r = Lv2Syscall3(840,
+                        (uint64_t)"/dev_hdd0/game/" APPID "/",
+                        (uint64_t)&size,
+                        (uint64_t)&avail);
 
-  int r = Lv2Syscall3(840,
-                      (uint64_t)"/dev_hdd0/game/" APPID "/",
-                      (uint64_t)&size,
-                      (uint64_t)&avail);
-
-  if(!r) {
-    prop_set(hddprop, "avail", PROP_SET_FLOAT, avail / 1000000000.0);
-    prop_set(hddprop, "size", PROP_SET_FLOAT,   size / 1000000000.0);
+    if(!r) {
+      prop_set(hddprop, "avail", PROP_SET_FLOAT, avail / 1000000000.0);
+      prop_set(hddprop, "size", PROP_SET_FLOAT,   size / 1000000000.0);
+    }
   }
 
 }
@@ -338,48 +342,14 @@ scan_root_fs(callout_t *co, void *aux)
 
 
 
-static int trace_fd = -1;
-static struct sockaddr_in log_server;
-
 void
 my_trace(const char *fmt, ...)
 {
-  char msg[1000];
   va_list ap;
-
-  if(trace_fd == -2)
-    return;
-
-  if(trace_fd == -1) {
-    int port = 4000;
-    char *p;
-
-    log_server.sin_len = sizeof(log_server);
-    log_server.sin_family = AF_INET;
-    
-    snprintf(msg, sizeof(msg), "%s", SHOWTIME_DEFAULT_LOGTARGET);
-    p = strchr(msg, ':');
-    if(p != NULL) {
-      *p++ = 0;
-      port = atoi(p);
-    }
-    log_server.sin_port = htons(port);
-    if(inet_pton(AF_INET, msg, &log_server.sin_addr) != 1) {
-      trace_fd = -2;
-      return;
-    }
-
-    trace_fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if(trace_fd == -1)
-      return;
-  }
-
   va_start(ap, fmt);
-  vsnprintf(msg, sizeof(msg), fmt, ap);
+  vprintf(fmt, ap);
   va_end(ap);
-
-  sendto(trace_fd, msg, strlen(msg), 0,
-	 (struct sockaddr*)&log_server, sizeof(log_server));
+  fflush(stdout);
 }
 
 /**
@@ -680,10 +650,15 @@ main(int argc, char **argv)
   int v;
   ps3_early_init(argc, argv);
 
-  gconf.concurrency = 2;
+  /* Cell PPE is a single-core dual-issue in-order processor.
+   * Restrict global concurrency to 1 to avoid L1/L2 cache thrashing,
+   * pipeline stalls, and thread contention with GameOS, audio, and RSX. */
+  gconf.concurrency = 1;
   gconf.can_standby = 1;
   gconf.trace_level = TRACE_DEBUG;
   gconf.arch_dev_opts = ps3_dev_opts;
+  gconf.log_server_ipv4 = 0;
+  gconf.log_server_port = 0;
 
   load_syms();
 

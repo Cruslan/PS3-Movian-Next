@@ -216,8 +216,13 @@ dvd_video_push(dvd_player_t *dp)
   mb->mb_cw = media_codec_ref(cw);
   mb->mb_aspect_override = dp->dp_aspect_override;
   mb->mb_disable_deinterlacer = 1;
-  mb->mb_data_type = MB_VIDEO;
-  mb->mb_duration = ctx->ticks_per_frame * 1000000LL * av_q2d(ctx->time_base);
+  if(ctx->framerate.num > 0) {
+    mb->mb_duration = 1000000LL * ctx->framerate.den / ctx->framerate.num;
+  } else if(ctx->time_base.den > 0) {
+    mb->mb_duration = 1000000LL * av_q2d(ctx->time_base);
+  } else {
+    mb->mb_duration = 40000;
+  }
   mb->mb_pts = AV_NOPTS_VALUE;
   mb->mb_dts = AV_NOPTS_VALUE;
 

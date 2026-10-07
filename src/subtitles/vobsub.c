@@ -537,7 +537,7 @@ vobsub_dtor(ext_subtitles_t *es)
   mp_release(vs->vs_mp);
 
   av_parser_close(vs->vs_parser);
-  av_free(vs->vs_ctx);
+  avcodec_free_context(&vs->vs_ctx);
   fa_close(vs->vs_sub);
 }
 
@@ -578,6 +578,8 @@ vobsub_load(const char *json, char *errbuf, size_t errlen,
 
   vs->vs_parser = av_parser_init(AV_CODEC_ID_DVD_SUBTITLE);
   vs->vs_ctx = avcodec_alloc_context3(NULL);
+  if(vs->vs_ctx != NULL)
+    vs->vs_ctx->thread_count = 1;
 
   if((vs->vs_sub = fa_open(subfile, errbuf, errlen)) == NULL) {
     buf_release(b);

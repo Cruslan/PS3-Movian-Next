@@ -231,7 +231,8 @@ play_video(const char *url, struct media_pipe *mp,
         int64_t deadline = arch_get_ts() + 10000000;
 
         while(type != NULL && !strcmp(rstr_get(type), "video") &&
-              source == NULL && arch_get_ts() < deadline) {
+              source == NULL && arch_get_ts() < deadline &&
+              !cancellable_is_cancelled(mp->mp_cancellable)) {
           struct prop_notify_queue q;
           prop_courier_wait(pc, &q, 1000);
           prop_notify_dispatch(&q, 0);
@@ -372,6 +373,13 @@ play_video(const char *url, struct media_pipe *mp,
     // Subtitle scanning can be turned of completely
     if(htsmsg_get_u32_or_default(m, "no_subtitle_scan", 0))
       flags |= BACKEND_VIDEO_NO_SUBTITLE_SCAN;
+
+    if(cancellable_is_cancelled(mp->mp_cancellable)) {
+      vsource_cleanup(&vsources);
+      if(m)
+        htsmsg_release(m);
+      return event_create_type(EVENT_EXIT);
+    }
 
     vs = LIST_FIRST(&vsources);
   
@@ -673,11 +681,15 @@ vq_entries_callback(void *opaque, prop_event_t event, ...)
   case PROP_HAVE_MORE_CHILDS_YES:
   case PROP_HAVE_MORE_CHILDS_NO:
   case PROP_SUGGEST_FOCUS:
+  case PROP_REQ_NEW_CHILD:
+  case PROP_REQ_DELETE:
+  case PROP_REQ_DELETE_VECTOR:
+  case PROP_REQ_MOVE_CHILD:
     break;
 
   default:
-    printf("Cant handle event %d\n", event);
-    abort();
+    TRACE(TRACE_DEBUG, "VIDEO_QUEUE", "Unhandled prop event %d", event);
+    break;
   }
   va_end(ap);
 }
@@ -809,6 +821,8 @@ video_player_idle(void *aux)
 
 
   while(run) {
+    if(cancellable_is_cancelled(mp->mp_cancellable))
+      break;
 
     if(play_url != NULL) {
       prop_set_void(errprop);
@@ -923,6 +937,19 @@ video_player_idle(void *aux)
       event_release(e);
       break;
 
+    } else if(event_is_action(e, ACTION_STOP) ||
+              event_is_action(e, ACTION_NAV_BACK)) {
+      rstr_release(play_url);
+      play_url = NULL;
+      prop_ref_dec(item_model);
+      item_model = NULL;
+      if(vq != NULL) {
+        video_queue_destroy(vq);
+        vq = NULL;
+      }
+      prop_set_string(mp->mp_prop_playstatus, "stop");
+      mp_flush(mp);
+
     } else if(event_is_type(e, EVENT_EOF) ||
               event_is_action(e, ACTION_SKIP_FORWARD) ||
               event_is_action(e, ACTION_SKIP_BACKWARD)) {
@@ -980,9 +1007,10 @@ video_player_idle(void *aux)
 void
 video_playback_create(media_pipe_t *mp)
 {
-  hts_thread_create_detached("video player",  video_player_idle,
-                             mp_retain(mp),
-			     THREAD_PRIO_DEMUXER);
+  hts_thread_create_joinable("video player", &mp->mp_player_thread,
+                             video_player_idle, mp_retain(mp),
+                             THREAD_PRIO_DEMUXER);
+  mp->mp_player_thread_valid = 1;
 }
 
 
@@ -992,9 +1020,21 @@ video_playback_create(media_pipe_t *mp)
 void
 video_playback_destroy(media_pipe_t *mp)
 {
+  hts_mutex_lock(&mp->mp_mutex);
+  cancellable_cancel(mp->mp_cancellable);
+  hts_cond_broadcast(&mp->mp_backpressure);
+  hts_cond_broadcast(&mp->mp_video.mq_avail);
+  hts_cond_broadcast(&mp->mp_audio.mq_avail);
+  hts_mutex_unlock(&mp->mp_mutex);
+
   event_t *e = event_create_type(EVENT_EXIT);
   mp_enqueue_event(mp, e);
   event_release(e);
+
+  if(mp->mp_player_thread_valid) {
+    hts_thread_join(&mp->mp_player_thread);
+    mp->mp_player_thread_valid = 0;
+  }
 }
 
 

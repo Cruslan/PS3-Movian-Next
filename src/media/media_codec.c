@@ -39,23 +39,19 @@ media_codec_deref(media_codec_t *cw)
 {
   if(atomic_dec(&cw->refcount))
     return;
-#if ENABLE_LIBAV
-  if(cw->ctx != NULL && cw->ctx->codec != NULL)
-    avcodec_close(cw->ctx);
 
-  if(cw->fmt_ctx != NULL && cw->fmt_ctx->codec != NULL)
-    avcodec_close(cw->fmt_ctx);
-#endif
-
+  /* Run codec close handler first while contexts are still valid */
   if(cw->close != NULL)
     cw->close(cw);
 
-  free(cw->ctx);
-
-  if(cw->fmt_ctx && cw->fw == NULL)
-    free(cw->fmt_ctx);
-
 #if ENABLE_LIBAV
+  /* Safely deallocate modern FFmpeg AVCodecContext structures */
+  if(cw->ctx != NULL)
+    avcodec_free_context(&cw->ctx);
+
+  if(cw->fmt_ctx != NULL)
+    avcodec_free_context(&cw->fmt_ctx);
+
   if(cw->parser_ctx != NULL)
     av_parser_close(cw->parser_ctx);
 
@@ -84,8 +80,10 @@ media_codec_create(int codec_id, int parser,
 
 #if ENABLE_LIBAV
   if(ctx != NULL && mcp != NULL) {
-    assert(ctx->extradata      == mcp->extradata);
     assert(ctx->extradata_size == mcp->extradata_size);
+    if(mcp->extradata_size > 0 && ctx->extradata != NULL && mcp->extradata != NULL) {
+      assert(memcmp(ctx->extradata, mcp->extradata, mcp->extradata_size) == 0);
+    }
   }
 #endif
 
@@ -99,6 +97,10 @@ media_codec_create(int codec_id, int parser,
       break;
 
   if(cd == NULL) {
+#if ENABLE_LIBAV
+    if(mc->fmt_ctx != NULL)
+      avcodec_free_context(&mc->fmt_ctx);
+#endif
     free(mc);
     return NULL;
   }

@@ -539,6 +539,8 @@ void
 video_decoder_destroy(video_decoder_t *vd)
 {
   sws_freeContext(vd->vd_sws);
-  avpicture_free(&vd->vd_convert);
+  /* Free modern FFmpeg AVFrame conversion buffer if allocated */
+  if(vd->vd_convert_frame != NULL)
+    av_frame_free(&vd->vd_convert_frame);
   free(vd);
 }

@@ -46,8 +46,7 @@
       TRACE(TRACE_DEBUG, "FA", x, ##__VA_ARGS__);                    \
   } while(0)
 
-
-extern int media_buffer_hungry;
+#include "media/media.h"
 
 
 
@@ -313,7 +312,7 @@ analyzer(scanner_t *s, int probe)
   /* Scan all entries */
   RB_FOREACH(fde, &s->s_fd->fd_entries, fde_link) {
 
-    while(media_buffer_hungry && s->s_running)
+    while(atomic_get(&media_buffer_hungry) && s->s_running)
       sleep(1);
 
     if(!s->s_running)
